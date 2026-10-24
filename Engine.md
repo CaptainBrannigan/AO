@@ -2,7 +2,9 @@
 
 Project configuration, engine stripping, profiling methodology, and the VR viability test. Rendering-specific techniques are in [Rendering.md](Rendering.md); AI-specific costs are in [AI.md](AI.md).
 
-**Project:** `C:\Dev\AO\AO` (`AO.uproject`, UE 5.7, created from the Blueprint VR template).
+**Project:** `C:\Dev\AO\AO` (`AO.uproject`, created from the VR template, now a C++ project).
+
+**Engine:** the **source build at `C:\Dev\Epic Games\UnrealEngine` (UE 5.8)**, which the project's engine association points to. Not the installed `C:\Dev\Epic Games\UE_5.7`. Build tools, Unreal Insights and plugin checks must all come from the source engine.
 
 ## Current direction
 
@@ -47,7 +49,11 @@ The VR template's config already has good VR basics but also several settings th
 
 ## Plugin stripping
 
-UE 5.7 enables **169 plugins by default**, on top of the template's own (OpenXR, OpenXREyeTracker, OpenXRHandTracking, PICOController). Disable them by adding `"Enabled": false` entries in `AO.uproject`. Editor-only plugins never ship in a packaged game, so they matter for editor speed and stability, not frame time.
+The engine enables well over 150 plugins by default (169 counted in the 5.7 install), on top of the template's own (OpenXR, OpenXREyeTracker, OpenXRHandTracking, PICOController). Disable them by adding `"Enabled": false` entries in `AO.uproject`. Editor-only plugins never ship in a packaged game, so they matter for editor speed and stability, not frame time.
+
+**Applied 2026-10-23:** 38 plugins disabled in `AO.uproject`, checked against the source engine for dependency conflicts (none). Kept enabled because other plugins depend on them: GeometryCache and VariantManagerContent (Interchange, Dataflow), MetaHumanSDK (Bridge). Source control and IDE integration plugins were re-enabled after disabling PerforceSourceControl stopped the editor from opening. They're editor-only with no runtime cost, so they stay enabled. After changing the plugin list, rebuild the editor target (`Build.bat AOEditor Win64 DebugGame -Project=...`) before opening.
+
+**Source-engine gotcha (shared binaries):** AO's editor target builds into the source engine's shared `Engine/Binaries`. Building it can give the engine a new build ID while only refreshing module manifests for the plugins AO enables. Opening the engine on its own, or another project (e.g. Lyra) whose plugin set differs, then fails with "module missing / built with a different engine version" for plugins outside AO's set (seen with CompositeCore). Fix: rebuild the engine's default editor target (`Build.bat UnrealEditor Win64 Development -WaitMutex`), then rebuild `AOEditor`, or accept the editor's rebuild prompt. The first open after plugin or renderer changes can freeze for a while while shaders recompile; that's expected.
 
 **Keep (in use or planned):**
 - OpenXR (+ EyeTracker/HandTracking if the target headset supports them)
@@ -79,6 +85,27 @@ UE 5.7 enables **169 plugins by default**, on top of the template's own (OpenXR,
 **Process:** disable in batches, restart, confirm the project still opens and the test map runs, then commit. Some plugins are dependencies of others, and the editor reports these on startup.
 
 **Modules:** a Blueprint-only project can't strip engine modules directly. Converting to a C++ project (needed anyway for the AI system) allows `Target.cs` settings for shipping builds (e.g. disabling unused engine features at compile time). This is a later, smaller win.
+
+## Profiling a packaged build
+
+**Baseline first: an empty level** (only the VR pawn, plus at most a single directional light and sky light). That measures the engine's fixed cost before any content.
+
+1. **Package a Development build** (Platforms → Windows → build configuration: Development, then Package Project). Development has console access, `stat` commands and full Insights tracing. Use Test builds later for numbers closer to shipping, and confirm tracing still connects there.
+2. **Start Unreal Insights first:** `C:\Dev\Epic Games\UnrealEngine\Engine\Binaries\Win64\UnrealInsights.exe` (built 2026-10-23; rebuild with `Engine\Build\BatchFiles\Build.bat UnrealInsights Win64 Development` after engine updates). It runs the trace server the game connects to. Use the Insights that matches the game's engine; trace formats differ between versions.
+3. **Launch the packaged game with tracing:**
+   `AO.exe -trace=default,gpu,frame,bookmark -tracehost=127.0.0.1`
+   - Add `-statnamedevents` for more detailed CPU scopes (adds overhead, so don't use it for headline numbers).
+   - Or start/stop from the console during play: `trace.start default,gpu` / `trace.stop`. `trace.bookmark <name>` marks a moment in the timeline.
+   - `-tracefile=<path>` writes a file instead of streaming to Insights.
+4. **Wear the headset while capturing.** An idle headset (proximity sensor uncovered) makes the runtime throttle or pause the app, which invalidates the numbers.
+5. **Capture procedure:** let it settle ~10 s, then 60 s standing still facing one direction, then a slow 360° turn. Bookmark each phase.
+6. **Read the trace in Timing Insights:** select the capture range and compare average and worst frames for **GameThread**, **RenderThread**, **RHIThread** and **GPU** against the frame budget.
+   - ⚠ **In VR, frame pacing makes threads wait on the XR runtime** (OpenXR's wait-frame). That time is idle, not cost. Total frame time is pinned to the refresh rate regardless of load. Measure each thread's actual work, excluding the waits.
+7. **Quick checks without Insights** (console in the desktop window): `stat unit`, `stat unitgraph`, `stat gpu`, `stat scenerendering` (draw calls, primitives), `stat rhi`.
+8. **Repeatable comparisons:** the CSV profiler (`csvprofile start` / `csvprofile stop`, written to `Saved/Profiling/CSV`) produces per-frame stats that are easy to compare across builds.
+9. **Compositor view:** the SteamVR frame timing graph (or the Meta/OpenXR runtime's equivalent) shows reprojection and dropped frames, which the engine's own numbers don't.
+
+**Record with every capture:** date, build config, hardware, headset, refresh rate, and scene/test name. Keep the trace files.
 
 ## VR viability test
 

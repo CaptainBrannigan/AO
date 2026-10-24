@@ -30,13 +30,15 @@ No fully "solved" alternative to the standard tradeoff was found. Server-authori
 **Enabling it** (requires converting the project to C++, which is needed anyway for the AI system):
 1. `AO.uproject` → `Plugins`: `{ "Name": "Iris", "Enabled": true }`.
 2. `AO.Build.cs`: `SetupIrisSupport(Target);`.
-3. `AOTarget.cs` and `AOEditorTarget.cs`: `bUseIris = true;`.
+3. ~~`bUseIris = true;` in the Target.cs files~~: **not needed in 5.7.** The setting no longer exists in UnrealBuildTool (Iris is always compiled in), so adding it breaks the build. Epic's docs still list it.
 4. `DefaultEngine.ini` → `[SystemSettings]`:
    - `net.SubObjects.DefaultUseSubObjectReplicationList=1` (required)
    - `net.Iris.UseIrisReplication=1` (required past 5.1)
-   - `net.IsPushModelEnabled=1` (required if `net.Iris.PushModelMode=1`). Push model is worth using regardless: properties are marked dirty explicitly instead of compared every frame.
-5. The net driver must have Iris enabled in its `IrisNetDriverConfigs` entry. Check Epic's docs for the exact entry.
+   - `net.IsPushModelEnabled=1`. Push model is worth using regardless: properties are marked dirty explicitly instead of compared every frame. Leave `net.Iris.PushModelMode` at its default (2 = enabled, runtime togglable) to keep A/B testing possible.
+5. Net driver: the engine's `BaseEngine.ini` already allows Iris on `GameNetDriver` (`+IrisNetDriverConfigs=(NetDriverDefinition=GameNetDriver, bCanUseIris=true)`), so no project entry is needed.
 6. Verify at runtime with the `LogIris` log category.
+
+**Status (2026-10-23):** steps 1, 2, 4 applied to `C:\Dev\AO\AO`.
 
 **Profiling:** add a replication test to the VR viability test ([Engine.md](Engine.md)): N replicated AI on a listen-server host, measuring host game thread and bandwidth, Iris vs. generic.
 
