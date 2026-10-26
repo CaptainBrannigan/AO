@@ -101,6 +101,7 @@ For moving parts on static meshes (e.g. a weapon's bolt), animated in the materi
 - [ ] UE import: **Material Import Method = Do Not Create Material**, then assign the master material instance.
 - [ ] Skeletal meshes: import onto the existing skeleton so animations still apply.
 - [ ] Verify with the debug-color material (hard-coded switch colors) before assigning the real palette.
+- [ ] **Material usage flags** (material → Details → Usage), saved in the asset: **Used with Nanite** for Nanite meshes, **Used with Instanced Static Meshes** for foliage/ISM/PCG, **Used with Skeletal Mesh** for characters. The editor sets these automatically, so things look correct in the editor, but a **packaged build** only has the flags that were saved. A missing flag makes the cooked game substitute the default material, and the mesh can end up rendered through the traditional (non-Nanite) path (found 2026-10-25, which skewed the first Nanite profiling runs). Check the packaged log for `missing usage flag` after every cook.
 
 ## Channel layout (packed export attribute)
 

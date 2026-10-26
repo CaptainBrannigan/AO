@@ -45,6 +45,10 @@ The VR template's config already has good VR basics but also several settings th
 | `r.Substrate` | True | **test both** | The new material system. Compare its base-pass cost against legacy materials with the color-region material before committing |
 | `TargetPlatforms` (uproject) | 12 platforms | Windows (+ Android if Quest standalone is a target) | Fewer platforms = fewer cooks and shader formats |
 
+**Status (2026-10-25):** Lumen GI/reflections, ray tracing and distance fields are off (committed). The forward-vs-deferred question reopened with testing: **Nanite needs the deferred renderer in practice**, and at large-map foliage density deferred + VSM + Nanite held 120 Hz where forward without Nanite fell to 85 fps (see "Test log" and [Rendering.md](Rendering.md)). Not yet decided project-wide. The Nanite builds were packaged with `r.ForwardShading=0` and `r.Shadow.Virtual.Enable=1`; the ini currently on disk is back to forward / VSM off but still has leftovers from those tests (`r.Mobile.ShadingPath=1`, `r.MobileHDR=True`, `r.Nanite.Foliage=True`). Once the path is chosen, make the ini match it and commit. For Nanite scenes: the directional light's **Cast Static Shadows off** (Nanite meshes don't receive baked shadows anyway) saved ~0.6 ms render thread.
+
+**Recommended: `r.NumBufferedOcclusionQueries=2`** (found 2026-10-26). With Nanite scenery, hardware occlusion queries only apply to non-Nanite meshes (characters), and waiting for their results from the GPU cost the render thread 1.4–2.6 ms per frame with 100 characters. Buffering them (use results from two frames ago) removed the wait entirely (render thread 4.44 → 1.92 ms, p99 6.71 → 2.36 ms) **while keeping occlusion culling**, which matters on maps where buildings hide many characters. Cost: an object revealed from behind an occluder can appear one frame (8 ms) late; frustum culling during head turns isn't delayed. Alternative: `r.AllowOcclusionQueries=0` gave the same render-thread result and no GPU cost in the open test map, but drops occlusion culling of non-Nanite meshes entirely. Not yet in `DefaultEngine.ini`.
+
 **Decision needed first: target hardware.** PCVR only, Quest standalone, or both. Standalone changes nearly everything: no Nanite, mobile shading path, much smaller budgets for draw calls, triangles and memory.
 
 ## Plugin stripping
@@ -54,6 +58,8 @@ The engine enables well over 150 plugins by default (169 counted in the 5.7 inst
 **Applied 2026-10-23:** 38 plugins disabled in `AO.uproject`, checked against the source engine for dependency conflicts (none). Kept enabled because other plugins depend on them: GeometryCache and VariantManagerContent (Interchange, Dataflow), MetaHumanSDK (Bridge). Source control and IDE integration plugins were re-enabled after disabling PerforceSourceControl stopped the editor from opening. They're editor-only with no runtime cost, so they stay enabled. After changing the plugin list, rebuild the editor target (`Build.bat AOEditor Win64 DebugGame -Project=...`) before opening.
 
 **Source-engine gotcha (shared binaries):** AO's editor target builds into the source engine's shared `Engine/Binaries`. Building it can give the engine a new build ID while only refreshing module manifests for the plugins AO enables. Opening the engine on its own, or another project (e.g. Lyra) whose plugin set differs, then fails with "module missing / built with a different engine version" for plugins outside AO's set (seen with CompositeCore). Fix: rebuild the engine's default editor target (`Build.bat UnrealEditor Win64 Development -WaitMutex`), then rebuild `AOEditor`, or accept the editor's rebuild prompt. The first open after plugin or renderer changes can freeze for a while while shaders recompile; that's expected.
+
+**Standalone engine programs aren't rebuilt with the editor.** In the source engine, Unreal Insights and UnrealLightmass are separate programs, always built in Development whatever the project's configuration (DebugGame only affects the game module). Rebuild them after engine updates: `Build.bat UnrealLightmass Win64 Development` (fixes "Unreal Lightmass executable is outdated") and `Build.bat UnrealInsights Win64 Development`. Swarm Agent (`Engine\Binaries\DotNET\SwarmAgent.exe`) runs the lighting builds and already exists.
 
 **Keep (in use or planned):**
 - OpenXR (+ EyeTracker/HandTracking if the target headset supports them)
@@ -105,7 +111,52 @@ The engine enables well over 150 plugins by default (169 counted in the 5.7 inst
 8. **Repeatable comparisons:** the CSV profiler (`csvprofile start` / `csvprofile stop`, written to `Saved/Profiling/CSV`) produces per-frame stats that are easy to compare across builds.
 9. **Compositor view:** the SteamVR frame timing graph (or the Meta/OpenXR runtime's equivalent) shows reprojection and dropped frames, which the engine's own numbers don't.
 
-**Record with every capture:** date, build config, hardware, headset, refresh rate, and scene/test name. Keep the trace files.
+**Record with every capture:** date, build config, hardware, headset, refresh rate, and scene/test name. Keep the trace files. Use a **fixed capture route** (same start pose, same turn, bookmarks) so runs are comparable; otherwise differences of ~0.5 ms aren't meaningful.
+
+### Analysis tooling (`Tools/Profiling`)
+
+One command summarizes a trace: frame pacing, real thread work with XR waits removed, render-thread hot spots, traditional vs. Nanite GPU draws, and the GPU pass breakdown:
+
+```powershell
+& "C:\Dev\AO\Tools\Profiling\analyze_trace.ps1" -Trace "C:\Users\Jordan\AppData\Local\UnrealEngine\Common\UnrealTrace\Store\001\<name>.utrace"
+```
+
+- `export_trace.ps1` runs Unreal Insights headless (`-NoUI -AutoQuit -ExecOnAnalysisCompleteCmd`) to export per-thread timing events to CSV. Insights strips backslashes from export paths, so the script passes forward slashes.
+- `TraceAnalyzer.cs` (compiled at runtime) does the statistics; PowerShell alone is too slow for traces of a few hundred MB.
+- Options: `-FrameBudgetMs` (default 8.333 = 120 Hz), `-SkipSeconds` (default 5, skips startup), `-OutDir`, `-SkipExport` to re-analyze already-exported CSVs, **`-IncludeWorkers`** to also export the task-graph worker threads (Foreground/Background Workers) and summarize their work. Use it whenever a main thread shows a large wait (`WaitForVisibilityTasks`, `TickCompletionEvents`, `WaitForTasks`): the waits only show that the main thread was blocked, while the workers show on what. Example: the render thread's "visibility" time turned out to be workers waiting on GPU occlusion query results (`GPUBound_WaitingForGPUForOcclusionQueries`), not CPU culling work.
+- How to read it: in VR, total frame time sits at the refresh rate. Look at "GameThread actual work", render-thread scene render, and GPU passes. "GPU traditional draws" should be near zero when all scenery is Nanite.
+
+### Testing gotchas found so far
+
+- **Verify what a packaged run actually used:** the packaged log records applied CVars (`Set CVar [[r.ForwardShading:...]]`) and material problems (`missing usage flag`). Check it before trusting a comparison. Two Nanite runs were invalid because the foliage material lacked a usage flag (see [MeshAuthoring.md](MeshAuthoring.md)).
+- **Find non-Nanite geometry in a packaged build:** console `ShowFlag.NaniteMeshes 0` hides Nanite meshes; anything still visible is drawn traditionally.
+- **`-nohmd`** runs the same build without VR (single view). Useful to rule VR stereo in or out; costs come out roughly half the VR numbers.
+- **SteamVR must not run elevated:** if `steam.exe` / `vrmonitor.exe` are set to *Run as administrator*, a normal-privilege game or editor can't connect to SteamVR (`Access is denied` on the `SteamVR_Namespace` pipe), hangs for minutes at OpenXR startup, and may start a second vrserver. Fixed 2026-10-24 by removing those compatibility flags. Diagnose via `C:\Steam\logs\xrclient_<app>.txt`.
+- **Steam Link encoder errors** (`NVENC: Invalid Level` in `C:\Steam\logs\driver_vrlink.txt`) can stall SteamVR. The PC-side `targetBandwidth` in `C:\Steam\config\steamvr.vrsettings` overrides the headset's "auto" setting.
+- **PowerShell launch quoting:** commas in `-trace=default,gpu,...` need quotes: `& "...\AO.exe" "-trace=default,gpu,frame,bookmark" "-tracehost=127.0.0.1"`.
+
+### Test log
+
+Trace files live in `C:\Users\Jordan\AppData\Local\UnrealEngine\Common\UnrealTrace\Store\001`. All at 120 Hz on Quest 3 via Steam Link. GPU = summed render passes (both eyes).
+
+| Trace | Scene / config | Result |
+|---|---|---|
+| `20261024_090704` | VR template level; package predated the config changes | 119.8 fps; game 1.20 ms, render 1.29 ms, GPU ~2.0–2.7 ms. Superseded |
+| `Baseline_NoNanite` | Empty level, forward, new config | 119.7 fps; game 1.16, render 0.98, GPU ~1.4 ms (post-processing 0.58, base 0.33, dynamic shadows 0.27) |
+| `Test_TreesOnly_NoNanite` | 1× trees, forward, VSM off | 119.8 fps, 0.12% over 12.5 ms; game 1.28, render 1.25, GPU ~2.9 ms |
+| `Test_TreesOnly_Nanite` | 1× trees, deferred + VSM + Nanite | **Invalid**: foliage material missing usage flag (drawn traditionally). Redo |
+| `Test_TreesOnly2_NoNanite` | 4× map + trees, forward, VSM off | **85.2 fps, 40.7% over 12.5 ms**; game 2.04, render 9.95 (visibility 8.95), GPU ~9.3 ms |
+| `Test_TreesOnly2_Nanite` | 4×, deferred + VSM + Nanite | **Invalid** (same usage-flag bug): 110.7 fps |
+| `Test_TreesOnly2_Nanite_nohmd` | Same build, `-nohmd` | Diagnostic: traditional draws present without VR too, ruling out stereo |
+| `Test_TreesOnly2_Nanite_ISMMatTurnedOn` | 4×, deferred + VSM + Nanite, flag fixed | **119.9 fps, 0.05%**; game 1.40, render 3.40 (visibility 1.59), GPU ~3.5 ms, traditional draws 0.10 ms |
+| `Test_TreesOnly2_Nanite_DynShadowsOn` | As above; light: static shadows off, dynamic on | **119.8 fps, 0.07%**; game 1.30, render 2.77 (visibility 0.93), GPU ~3.6 ms. Baseline for the character tests |
+| `Test_TreesOnly2_Nan_SKM_*` (5 runs, 2026-10-26) | + 100 static SkeletalMeshActors, tick on, various shadow/tick settings | Game ~3.4 ms (skeletal mesh tick ~20 µs/character); GPU +1.2 ms (SKM base pass 0.6 + velocity 0.6). Shadow results unreliable (characters too far for shadows to render). See AI.md |
+| `…SKM_ShadowsWorking_NoTickSpawnAtLevel_StaticRender` | 100 close Render Static characters, shadows on | Game 1.57, render 4.44 (p99 6.71; wait on GPU occlusion queries 2.6 ms), GPU ~4.9 ms |
+| `…SKM_NoShadows_NoTick_SpawnAtLevel_StaticRender` | Same, shadows off | Game 1.43, render 3.26 (occlusion-query wait 1.4 ms), GPU ~4.8 ms |
+| `…SKM_Shadows_OcclusionQueryOffBuffer2` | Same as shadows-on run + `r.AllowOcclusionQueries 0` | **120.0 fps, 0%**; game 1.43, **render 1.91 (p99 2.21)**, GPU ~4.8 ms |
+| `…SKM_Shadows_OcclusionQueryBuffer2` | Shadows on, queries **on** + `r.NumBufferedOcclusionQueries 2` | **120.0 fps, 0%**; game 1.42, **render 1.92 (p99 2.36)**, wait 0, GPU ~4.8 ms. **Current baseline / recommended setting** |
+| `…SKM_NoShadows_OcclusionQueryOffBuffer2` | Shadows off + queries off | 120.0 fps, 0%; game 1.47, render 1.94, GPU ~4.8 ms |
+| `…SKM_Shadows_Animated` | 100 close characters, Animation Blueprint, shadows on, buffered queries (from ini) | 119.8 fps, 0.11%; **game 3.44** (~20 µs/character), render 1.99, workers ~2.9 ms animation, **GPU ~5.3 ms** (VSM shadows 0.35 → 0.74 ms). Current baseline for animation work |
 
 ## VR viability test
 

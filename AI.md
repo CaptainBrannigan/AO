@@ -189,6 +189,74 @@ Rendering many AI is its own cost, separate from decision-making. General charac
 
 **Distance-based swap:** AI near the player use full skeletal meshes (IK, ragdoll, precise hits); distant AI switch to baked-animation static meshes. Most AI on a large map are far away at any given moment, so this is where the density goal gets most of its headroom.
 
+### Movement simulation LOD (off-screen / distant / unloaded AI)
+
+**Idea (2026-10-26):** when an AI isn't visible, stop its real movement (CharacterMovement, per-tick path following) and instead track an *approximate* position cheaply: store its path, speed and start time, and compute where it would be from elapsed time (a timer, with the bookkeeping on a background thread). When it becomes relevant again, place it at that computed position and resume full simulation. The same mechanism covers distant AI and AI in map sections that are streamed out.
+
+Notes for when this gets built:
+- **The computation is cheap and analytic:** position = distance along the stored nav path at `speed × elapsed time`, so it only needs evaluating when queried (re-materializing, perception checks, map-wide events). A background thread is useful for batch-updating many agents (e.g. keeping a spatial grid current for occurrences/perception), not because each update is expensive.
+- **Multiplayer: "visible" must mean visible to *any* player.** The authoritative machine can't use one player's view. Use distance/relevance to all players (with hysteresis so agents don't flip back and forth), not per-view visibility.
+- **Re-materialize before entering view:** promote to full simulation at a larger radius than the view distance (or frustum plus a margin), so agents never visibly pop into place. Project the computed position onto the nav mesh first.
+- **Promote on involvement:** an abstracted AI touched by an event (shot at, perceives a disturbance, joins a fight; see "World events as occurrences") switches to full simulation immediately.
+- **Unloaded sections:** the AI has to exist as a lightweight record rather than an Actor while its section is streamed out, with the Actor spawned when relevant. The same "records, not Actors" model as the item pool in [Networking.md](Networking.md).
+- **Decisions at lower frequency too:** the Purpose system can evaluate abstracted AI less often (or only on promotion), not just skip movement.
+- **Replication:** abstracted AI don't need replicating until promoted (Iris relevance).
+- **Precedent:** this is "simulation LOD", the same idea as Epic's Mass framework (MassAI runs cheap, lower-fidelity simulation for distant agents and spawns full Actors only near players) and long-standing open-world crowd systems. Mass is worth evaluating as the implementation instead of building it from scratch.
+- Pairs with the rendering-side distance swap (baked-animation bodies for distant AI) and the shadow LOD below.
+
+### Character shadows
+
+Animated skeletal meshes are expensive shadow casters, especially with Virtual Shadow Maps (the current Nanite setup; see [Rendering.md](Rendering.md)). An animated mesh **invalidates its shadow pages every frame, even standing still**, because idle animation counts as change, and skeletal meshes take the non-Nanite shadow path (roughly 1.6× the Nanite path per page, per the VSM article in Rendering.md). With dense AI this multiplies. Options:
+
+- **Hidden static shadow proxy:** the visible animated mesh has *Cast Shadow* off; a simple static blockout attached to the character (ideally a Nanite static mesh) has *Visible* off and **Cast Hidden Shadow** on. The same trick is used for wind-animated trees.
+  - Saves: no skinning in the shadow pass (cheap static geometry instead), and **idle characters stop invalidating shadows**, since a static proxy only invalidates when the character actually moves. Big win for AI standing guard or idling in groups.
+  - Doesn't save: a *moving* character still invalidates every frame (any moving caster does). For running AI the gain is only the cheaper geometry.
+  - Cost: the shadow doesn't animate (legs/arms become a rigid shape), which can look wrong close to the player in VR.
+- **Capsule shadows (built into UE):** assign a *Shadow Physics Asset* (a few capsules on the main bones) to the skeletal mesh and enable *Cast Capsule Direct Shadow*. The shadow follows the animation but is computed from capsules, far cheaper than rendering the skinned mesh into shadow maps. Designed for many characters. Verify how it looks with the project's lights and VSM before committing.
+- **No character shadows** beyond some distance.
+
+**Direction: shadow LOD by distance.** Near the player: real skinned shadows or capsule shadows (where shadows get noticed). Mid distance: capsule shadows or the static proxy. Far: none. This pairs with the baked-animation swap for distant AI, which are rigid meshes anyway.
+
+### AI rendering test plan
+
+Run on the 4× Nanite baseline scene (see [Engine.md](Engine.md) → "Test log"), stepping AI counts (e.g. 10 / 25 / 50 / 100), using the same capture route every time:
+
+1. **Skeletal meshes, not animated:** per-character draw and visibility cost. Skeletal meshes aren't Nanite, so this shows the traditional path returning as counts grow.
+2. **Animated skeletal meshes:** adds animation evaluation, skinning and VSM invalidation. At one fixed count, run four shadow variants:
+   1. Full skinned shadows
+   2. No character shadows (the upper bound on savings)
+   3. Hidden static proxy shadows
+   4. Capsule shadows
+3. **Animated AI running behaviors:** adds game-thread cost (CharacterMovement, navigation, the Purpose system) on top of rendering.
+
+Also worth an A/B once animation is in: Update Rate Optimization and AnimationSharing on/off.
+
+**Results so far (2026-10-26, 100 non-animated SkeletalMeshActors, 4× Nanite scene):**
+
+| Cost | Total (100 SKMs) | Per character |
+|---|---|---|
+| Game thread: `USkinnedMeshComponent::TickComponent` (0.95 ms) + waiting on parallel animation tasks | ~2.0–2.15 ms | ~20 µs |
+| GPU: SKM base pass (traditional draws, stereo) | 0.60 ms | ~6 µs |
+| GPU: velocity pass (`RenderVelocities`, new with skeletal meshes) | 0.58 ms | ~6 µs |
+| Shadows on: render-thread visibility (`ProcessVisibilityTasks` 0.20 → 2.17 ms) | ~2.0 ms | ~20 µs |
+| Shadows on: GPU shadow passes | ~0.15 ms | ~1.5 µs |
+
+- **Skeletal meshes tick every frame even with no animation playing.** Static characters should have the SkeletalMeshComponent's tick disabled.
+- **Render Static + spawning at runtime removes the tick (2026-10-26):** `USkinnedMeshComponent_TickComponent` dropped from ~102×/frame to 2 (the hands). Game thread: **1.68 ms** vs 3.41 ms ticking vs 1.30 ms baseline, so 100 static, non-ticking characters cost **~0.4 ms game thread (~4 µs each)**. GPU unchanged: base pass 0.66 ms, and the velocity pass (~0.6 ms) still draws even though nothing moves.
+- **Render-thread `WaitForVisibilityTasks` is a wait, not a cost.** It measures the render thread waiting on visibility work running on worker threads, so it shrinks when the game thread is slow (the work finishes first) and grows when the game thread is fast (Render Static run: 1.36 ms avg, 1.23 median, vs ~0 median while ticking). This explains the inconsistent visibility numbers across runs. Measure the worker-thread visibility work directly before drawing conclusions from it.
+- **Render-thread "visibility" time is a wait on GPU occlusion query results (worker-thread export, 2026-10-26, 100 close Render Static characters):** worker threads show `OcclusionCullPipe` → `GPUBound_WaitingForGPUForOcclusionQueries` at **1.52 ms/frame (shadows off) vs 2.68 ms (shadows on)**, while actual visibility computation (`ComputeViewRelevance`) is ~0.08 ms. Non-Nanite meshes (the skeletal meshes) are culled with hardware occlusion queries; the visibility task waits for the GPU to return them, and the render thread waits on that task (`WaitForVisibilityTasks` 1.44 / 2.61 ms; scene render 3.26 / 4.44 ms). Shadows lengthen the wait because the GPU is busier, not because of more CPU work; GPU shadow passes barely changed (~0.82 → 0.85 ms). Nanite does its own GPU occlusion culling, so Nanite-only scenes don't show this. **Next A/B:** `r.NumBufferedOcclusionQueries 2` (read results from 2 frames ago, so less waiting and one frame more latency for newly revealed meshes) and `r.AllowOcclusionQueries 0` (no queries, no wait; occluded meshes get drawn instead, costing GPU).
+- **Occlusion queries off removes it (2026-10-26):** with `r.AllowOcclusionQueries 0` (plus `r.NumBufferedOcclusionQueries 2`, which does nothing once queries are off), render-thread scene render dropped to **1.91 ms with shadows on / 1.94 ms off** (p99 2.21 ms, from 6.71 ms), `WaitForVisibilityTasks` → 0, **0 frames over 12.5 ms**. GPU unchanged (~4.8 ms; HZB slightly cheaper), because little occludes the characters in this open terrain. **Follow-up, same day: `r.NumBufferedOcclusionQueries 2` with queries left on matched it** (render 1.92 ms, p99 2.36 ms, wait 0) while keeping occlusion culling, so that's the recommended setting (see Engine.md). **Static character shadows are effectively free** once the wait is gone (Render Static meshes' shadow pages stay cached). Scene totals at this point (4× Nanite foliage, dynamic shadows, 100 static characters): game 1.43 ms, render 1.91 ms, **GPU ~4.8 ms (now the largest)**. Biggest removable GPU item: skeletal mesh velocity pass ~0.6 ms.
+- **Animated, shadows on (2026-10-26, 100 close characters with an Animation Blueprint, buffered occlusion queries):** game thread **3.44 ms** (vs 1.42 static): `CompleteParallelAnimationEvaluation` 0.79 ms + waiting on parallel animation tasks 0.64 ms + component tick ~0.3 ms, **~20 µs/character, about the same as the ticking non-animated run (3.41 ms)**, so the game-thread cost is mostly per-component tick/completion overhead, not animation math. Animation itself runs on **worker threads, ~2.9 ms total across cores** (Animation Blueprint `NewAnimBlueprint_C` 0.37 ms, render-state updates 0.47 ms). Render thread 1.99 ms (unchanged). **GPU ~5.3 ms (+0.4 ms): VSM shadow re-rendering 0.35 → 0.74 ms**, since animated meshes invalidate their shadow pages every frame. Frames over 12.5 ms 0.11%. Linear extrapolation to the ~7 ms target: GPU is the first limit (~100 more visible animated characters), game thread ~175 more, before AI logic. **Next levers:** Update Rate Optimizations + *Only Tick Pose when Rendered*; *Use Animation Asset* vs. Animation Blueprint; character shadow LOD; the velocity pass (~0.6 ms GPU).
+- **Shadows were a distance issue, not broken:** character shadows render in game when the characters are close; the earlier "shadows not rendering" runs had characters spawned too far away. Shadow distance settings not yet tuned.
+- **⚠ The far-spawned shadow on/off comparisons below are unreliable:** in those runs the characters were too far away for their shadows to render, so "shadows on" wasn't really on. Use the close-layout runs above instead.
+- **Character shadows appeared cheap for static characters.** With all 100 kept in view and shadows on (2026-10-26, montage-only tick run), render-thread visibility averaged 0.27 ms vs 0.20 ms without shadows; the earlier 2.17 ms run was an outlier (visibility swings with how many characters are in view). Shadow cost for 100 static characters: ~0.07 ms render thread + ~0.15 ms GPU. Expect this to change with animation, since animated meshes invalidate VSM pages every frame.
+- **`VisibilityBasedAnimTickOption = OnlyTickMontagesAndRefreshBonesWhenPlayingMontages` doesn't remove the tick:** `USkinnedMeshComponent_TickComponent` still ran ~102×/frame (100 characters + 2 hands) at ~10 µs each (~1 ms/frame). Game thread stayed at ~3.4 ms.
+- **Disabling tick didn't take effect in the 2026-10-26 "NoTick" runs.** The spawner (`MeshArrayPlacer.PlaceArray`) calls `SetActorTickEnabled(false)` / `SetComponentTickEnabled(false)` right after spawning. If it runs in the editor, that only changes the live tick state, not the saved *Start with Tick Enabled* property, so the components tick again at game start. Options: **Render Static** (`bRenderStatic`, a saved property, so it persists when set from an editor-run Blueprint; `USkeletalMeshComponent` then disables its own tick, `SkeletalMeshComponent.cpp:1068`), a SkeletalMeshActor child Blueprint with *Start with Tick Enabled* off in its class defaults, or running the spawner at runtime. Verify in the packaged build with `DumpTicks`.
+- **The velocity pass is only needed for temporal AA (TAA/TSR) or motion blur.** Check which AA the deferred builds actually use (MSAA, the configured method, is forward-only); if not temporal, velocity output is ~0.6 ms of wasted GPU.
+- Frame pacing held 120 Hz in both runs.
+
+**Next runs:** tick off + shadows off (fixed cost floor); then animated with *Use Animation Asset* (pure evaluation + skinning), then an Animation Blueprint (its overhead), with Update Rate Optimizations / *Visibility Based Anim Tick Option* A/B.
+
 ## Networking
 
 ### Purpose system across client-authoritative regions
