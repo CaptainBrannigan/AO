@@ -1,0 +1,24 @@
+// Copyright Jordan Cain. All Rights Reserved.
+
+
+#include "QueryContextAsset.h"
+
+UE_DEFINE_GAMEPLAY_TAG(TAG_Contextual_Position, "Contextual.Position");
+UE_DEFINE_GAMEPLAY_TAG(TAG_Contextual_Position_Cover_AtLocation, "Contextual.Position.Cover.AtLocation");
+UE_DEFINE_GAMEPLAY_TAG(TAG_Contextual_Position_Cover_Moving, "Contextual.Position.Cover.Moving");
+UE_DEFINE_GAMEPLAY_TAG(TAG_Contextual_Position_Cover_Seeking, "Contextual.Position.Cover.Seeking");
+UE_DEFINE_GAMEPLAY_TAG(TAG_Contextual_Position_Flank_AtLocation, "Contextual.Position.Flank.AtLocation");
+UE_DEFINE_GAMEPLAY_TAG(TAG_Contextual_Position_Flank_Moving, "Contextual.Position.Flank.Moving");
+UE_DEFINE_GAMEPLAY_TAG(TAG_Contextual_Position_Flank_Seeking, "Contextual.Position.Flank.Seeking");
+UE_DEFINE_GAMEPLAY_TAG(TAG_Contextual_Position_Investigative_NearInstigator_AtLocation, "Contextual.Position.Investigative.NearInstigator.AtLocation");
+UE_DEFINE_GAMEPLAY_TAG(TAG_Contextual_Position_Investigative_NearInstigator_Moving, "Contextual.Position.Investigative.Moving");
+UE_DEFINE_GAMEPLAY_TAG(TAG_Contextual_Position_Investigative_NearInstigator_Seeking, "Contextual.Position.Investigative.Seeking");
+UE_DEFINE_GAMEPLAY_TAG(TAG_Contextual_Position_Investigative_RandNearby_AtLocation, "Contextual.Position.Investigative.RandNearby.AtLocation");
+UE_DEFINE_GAMEPLAY_TAG(TAG_Contextual_Position_Investigative_RandNearby_Moving, "Contextual.Position.Investigative.RandNearby.Moving");
+UE_DEFINE_GAMEPLAY_TAG(TAG_Contextual_Position_Investigative_RandNearby_Seeking, "Contextual.Position.Investigative.RandNearby.Seeking");
+UE_DEFINE_GAMEPLAY_TAG(TAG_Contextual_Position_Investigative_LastKnownEnemyPosition_AtLocation, "Contextual.Position.Investigative.LastKnownEnemyPosition.AtLocation");
+UE_DEFINE_GAMEPLAY_TAG(TAG_Contextual_Position_Investigative_LastKnownEnemyPosition_Moving, "Contextual.Position.Investigative.LastKnownEnemyPosition.Moving");
+UE_DEFINE_GAMEPLAY_TAG(TAG_Contextual_Position_Investigative_LastKnownEnemyPosition_Seeking, "Contextual.Position.Investigative.LastKnownEnemyPosition.Seeking");
+UE_DEFINE_GAMEPLAY_TAG(TAG_Contextual_Position_Patrol_AtLocation, "Contextual.Position.Patrol.AtLocation");
+UE_DEFINE_GAMEPLAY_TAG(TAG_Contextual_Position_Patrol_Moving, "Contextual.Position.Patrol.Moving");
+UE_DEFINE_GAMEPLAY_TAG(TAG_Contextual_Position_Patrol_Seeking, "Contextual.Position.Patrol.Seeking");

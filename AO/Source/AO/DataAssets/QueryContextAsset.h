@@ -1,0 +1,46 @@
+// Copyright Jordan Cain. All Rights Reserved.
+
+#pragma once
+
+#include "CoreMinimal.h"
+#include "Engine/DataAsset.h"
+#include "GameplayTagContainer.h"
+#include "NativeGameplayTags.h"
+#include "QueryContextAsset.generated.h"
+
+UE_DECLARE_GAMEPLAY_TAG_EXTERN(TAG_Contextual_Position);
+UE_DECLARE_GAMEPLAY_TAG_EXTERN(TAG_Contextual_Position_Cover_AtLocation);
+UE_DECLARE_GAMEPLAY_TAG_EXTERN(TAG_Contextual_Position_Cover_Moving);
+UE_DECLARE_GAMEPLAY_TAG_EXTERN(TAG_Contextual_Position_Cover_Seeking);
+UE_DECLARE_GAMEPLAY_TAG_EXTERN(TAG_Contextual_Position_Flank_AtLocation);
+UE_DECLARE_GAMEPLAY_TAG_EXTERN(TAG_Contextual_Position_Flank_Moving);
+UE_DECLARE_GAMEPLAY_TAG_EXTERN(TAG_Contextual_Position_Flank_Seeking);
+UE_DECLARE_GAMEPLAY_TAG_EXTERN(TAG_Contextual_Position_Investigative_NearInstigator_AtLocation);
+UE_DECLARE_GAMEPLAY_TAG_EXTERN(TAG_Contextual_Position_Investigative_NearInstigator_Moving);
+UE_DECLARE_GAMEPLAY_TAG_EXTERN(TAG_Contextual_Position_Investigative_NearInstigator_Seeking);
+UE_DECLARE_GAMEPLAY_TAG_EXTERN(TAG_Contextual_Position_Investigative_RandNearby_AtLocation);
+UE_DECLARE_GAMEPLAY_TAG_EXTERN(TAG_Contextual_Position_Investigative_RandNearby_Moving);
+UE_DECLARE_GAMEPLAY_TAG_EXTERN(TAG_Contextual_Position_Investigative_RandNearby_Seeking);
+UE_DECLARE_GAMEPLAY_TAG_EXTERN(TAG_Contextual_Position_Investigative_LastKnownEnemyPosition_AtLocation);
+UE_DECLARE_GAMEPLAY_TAG_EXTERN(TAG_Contextual_Position_Investigative_LastKnownEnemyPosition_Moving);
+UE_DECLARE_GAMEPLAY_TAG_EXTERN(TAG_Contextual_Position_Investigative_LastKnownEnemyPosition_Seeking);
+UE_DECLARE_GAMEPLAY_TAG_EXTERN(TAG_Contextual_Position_Patrol_AtLocation);
+UE_DECLARE_GAMEPLAY_TAG_EXTERN(TAG_Contextual_Position_Patrol_Moving);
+UE_DECLARE_GAMEPLAY_TAG_EXTERN(TAG_Contextual_Position_Patrol_Seeking);
+
+UCLASS()
+/// <summary>
+/// This asset ties environment queries to a contextual tag for the Purpose system
+/// </summary>
+class UQueryContextAsset : public UPrimaryDataAsset
+{
+	GENERATED_BODY()
+	
+public:
+	
+	UPROPERTY(EditAnywhere)
+	TObjectPtr<class UEnvQuery> query;
+	
+	UPROPERTY(EditAnywhere)
+	FGameplayTagContainer contextualTagsForQuery;
+};

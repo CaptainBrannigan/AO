@@ -1,0 +1,76 @@
+// Copyright Jordan Cain. All Rights Reserved.
+
+
+#include "AISpawn.h"
+#include "Purpose/DataChunks/ActorRole.h"
+#include "Purpose/DataChunks/ActorLocation.h"
+
+// Sets default values
+AAISpawner::AAISpawner()
+{
+	// Set this actor to call Tick() every frame.  You can turn this off to improve performance if you don't need it.
+	PrimaryActorTick.bCanEverTick = false;
+
+	UActorRole* roleChunk = CreateDefaultSubobject<UActorRole>("UActorRole");
+	roleChunk->roles.Add(FRoleEntry(EActorRole::AI));
+	data.Add(FDataMapEntry(roleChunk));
+
+	UActorLocation& locationChunk = CreateDefaultSubobject<UActorLocation>("UActorLocation")->Initialize(this);
+	data.Add(FDataMapEntry(&locationChunk));
+}
+
+// Called when the game starts or when spawned
+void AAISpawner::BeginPlay()
+{
+	Super::BeginPlay();
+}
+
+void AAISpawner::InitializeTriggersForSpawn()
+{
+#if WITH_EDITOR
+
+	for (TObjectPtr<ATriggerBase> trigger : spawnZones)
+	{
+		trigger->SetFolderPath("SpawnZones");
+		FString displayName = "SpawnZone-" + trigger->GetClass()->GetName();
+		if (HasData(UActorRole::StaticClass()))
+		{
+			displayName += "-" + DataChunk<UActorRole>()->ValueAsString();
+		}
+		trigger->Rename(*displayName);
+		trigger->SetActorLabel(*displayName);
+		trigger->SetActorEnableCollision(false);
+		trigger->GetCollisionComponent()->SetCanEverAffectNavigation(false);
+		trigger->GetCollisionComponent()->bNavigationRelevant = false;
+		trigger->GetCollisionComponent()->SetAreaClassOverride(nullptr);
+		trigger->GetCollisionComponent()->SetGenerateOverlapEvents(false);
+		trigger->GetCollisionComponent()->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		trigger->GetCollisionComponent()->SetCollisionResponseToAllChannels(ECollisionResponse::ECR_Ignore);
+		trigger->GetCollisionComponent()->SetEnableGravity(false);
+		trigger->GetCollisionComponent()->SetMobility(EComponentMobility::Static);
+		trigger->GetCollisionComponent()->CanCharacterStepUpOn = ECanBeCharacterBase::ECB_No;
+		trigger->GetCollisionComponent()->SetSimulatePhysics(false);
+		trigger->GetCollisionComponent()->bReplicatePhysicsToAutonomousProxy = false;
+		trigger->GetCollisionComponent()->bApplyImpulseOnDamage = false;
+		trigger->GetCollisionComponent()->bIgnoreRadialImpulse = true;
+	}
+	
+#endif
+}
+
+void AAISpawner::AddData_Implementation(UDataChunk* inData, bool overwriteValue)
+{
+	AddDataLocal(*inData, overwriteValue);
+}
+
+void AAISpawner::AppendData_Implementation(const TArray<FDataMapEntry>& inDataMap, bool overwriteValue)
+{
+	AppendDataLocal(inDataMap, overwriteValue);
+}
+
+void AAISpawner::RemoveData_Implementation(TSubclassOf<UDataChunk> inClass)
+{
+	RemoveDataLocal(inClass);
+}
+
+

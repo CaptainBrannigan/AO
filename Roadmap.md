@@ -34,6 +34,7 @@ Alongside: define the "why play?" (see [Vision.md](Vision.md)).
 - Land the Purpose system fixes (load-balancer bug and fixed-sleep throughput cap first). → [AI.md](AI.md)
 - Separate perception from decision before scaling up AI density.
 - Distance-based swap to baked-animation bodies for distant AI.
+- Delegated decision-making: the first player in an area runs that area's AI brains, the host executes. Measure host CPU vs. upload bandwidth first.
 
 ## Physics & destruction
 

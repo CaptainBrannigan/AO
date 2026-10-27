@@ -1,0 +1,783 @@
+DATACHUNKS AS STRUCTS: BASELINE STRUCTURE
+==========================================
+
+Illustrative code for comparing structure, not compiled. Logging, comments and
+edge-case handling from the current code are left out so the shape is visible.
+Each section shows CURRENT (abbreviated) then PROPOSED.
+
+Key ideas
+---------
+1. A chunk's NAME is a gameplay tag (Data.Patrol.LeaderCount, Data.Status.Alarm).
+   A chunk's LOGIC is its C++ struct type (FFloatChunk, FActorLocationChunk, ...).
+   Today both are carried by the UClass. Splitting them keeps precise names
+   without needing a Blueprint class per name, and keeps derived logic in C++.
+2. Conditions still target a BASE type (FFloatChunk) and work for any struct
+   derived from it, exactly like TSubclassOf<UFloatChunk> today.
+3. Chunks are values. Copying a DataMap copies the data, so the evaluation
+   thread gets its own snapshot instead of pointers to objects the game
+   thread is changing.
+4. Live-derived values (actor location, etc.) are resolved on the game thread
+   when the snapshot is taken, so the evaluation thread never touches actors.
+5. Modifiers (what a purpose does to data when it's selected/finished) become
+   their own structs instead of fields carried by every runtime chunk.
+
+
+------------------------------------------------------------------------------
+1. DATA CHUNK BASE  (Data/Data.h)
+------------------------------------------------------------------------------
+
+CURRENT
+    UCLASS(Abstract, EditInlineNew)
+    class UDataChunk : public UObject
+    {
+        virtual bool HasValue();
+        virtual TObjectPtr<UDataChunk> AdjustData(const UDataChunk& inModifier);
+        virtual void CopyDataFrom(TObjectPtr<UDataChunk> ChunkToCopyFrom);
+        virtual const uint8 DataModifier();
+        virtual FString Description() const;
+        bool IsSupportedForNetworking() const final { return true; }
+    };
+
+PROPOSED
+    #include "StructUtils/InstancedStruct.h"   // lives in CoreUObject since 5.5
+
+    USTRUCT(BlueprintType)
+    struct AO_API FDataChunk
+    {
+        GENERATED_BODY()
+        virtual ~FDataChunk() = default;          // required: polymorphic USTRUCT
+
+        virtual bool HasValue() const { return false; }
+
+        // Game thread only. Called when a DataMap snapshot is taken for an
+        // occurrence. Chunks whose value comes from the world (actor location,
+        // velocity) copy it into plain data here, so evaluation never reads
+        // live actors from the worker thread. Most chunks do nothing.
+        virtual void ResolveForSnapshot() {}
+
+        virtual FString Description() const { return FString(); }
+    };
+
+    // Value types: a handful cover everything. Each can be derived from in C++
+    // for chunks that need their own logic.
+
+    USTRUCT(BlueprintType)
+    struct AO_API FFloatChunk : public FDataChunk
+    {
+        GENERATED_BODY()
+        UPROPERTY(EditAnywhere, BlueprintReadWrite) float Value = 0.f;
+
+        // Virtual so derived chunks can compute it. Conditions call this.
+        virtual float GetValue() const { return Value; }
+        virtual bool HasValue() const override { return true; }
+    };
+
+    USTRUCT(BlueprintType)
+    struct AO_API FVectorChunk : public FDataChunk
+    {
+        GENERATED_BODY()
+        UPROPERTY(EditAnywhere, BlueprintReadWrite) FVector Value = FVector::ZeroVector;
+
+        virtual FVector GetValue() const { return Value; }
+        virtual bool HasValue() const override { return !Value.ContainsNaN() && !Value.IsZero(); }
+    };
+
+    USTRUCT(BlueprintType)
+    struct AO_API FActorReferenceChunk : public FDataChunk
+    {
+        GENERATED_BODY()
+        UPROPERTY(EditAnywhere, BlueprintReadWrite) TWeakObjectPtr<AActor> Actor;   // weak: a chunk never keeps an actor alive
+        virtual bool HasValue() const override { return Actor.IsValid(); }
+    };
+
+    USTRUCT(BlueprintType)
+    struct AO_API FTagsChunk : public FDataChunk          // was UContextualTags
+    {
+        GENERATED_BODY()
+        UPROPERTY(EditAnywhere, BlueprintReadWrite) FGameplayTagContainer Value;
+        virtual bool HasValue() const override { return true; }
+    };
+
+    USTRUCT(BlueprintType)
+    struct AO_API FContextHistoryEntry                     // unchanged
+    {
+        GENERATED_BODY()
+        UPROPERTY() FGameplayTag ContextualTag;
+        UPROPERTY() FDateTime TimeOfContext;
+    };
+
+    USTRUCT(BlueprintType)
+    struct AO_API FHistoryChunk : public FDataChunk        // was UContextualHistory
+    {
+        GENERATED_BODY()
+        UPROPERTY(VisibleAnywhere) TArray<FContextHistoryEntry> Entries;
+        void AddOrRefresh(FGameplayTag Tag, FDateTime Time);
+        const FContextHistoryEntry* Find(FGameplayTag Tag) const;
+        virtual bool HasValue() const override { return true; }
+    };
+
+    USTRUCT(BlueprintType)
+    struct AO_API FTimeChunk : public FDataChunk           // was UTimeOf / UTimeOfOccurrence
+    {
+        GENERATED_BODY()
+        UPROPERTY() FDateTime Value = FDateTime::UtcNow();
+        virtual bool HasValue() const override { return true; }
+    };
+
+
+------------------------------------------------------------------------------
+2. DERIVED CHUNKS WITH THEIR OWN LOGIC  (answers "can derived chunks compute Value()?")
+------------------------------------------------------------------------------
+
+Yes. Struct inheritance and virtual functions work the same way they do on the
+UObject classes. What you lose is creating NEW LOGIC in Blueprint; Blueprint
+variants that only set values (PatrolLeaderCount_C) become tags instead.
+
+CURRENT (UActorLocation: reads the actor live, which happens on the worker thread)
+    const FVector Value() const final { return IsValid(actor) ? actor->GetActorLocation() : FVector(0,0,0); }
+
+PROPOSED
+    USTRUCT(BlueprintType)
+    struct AO_API FActorLocationChunk : public FVectorChunk
+    {
+        GENERATED_BODY()
+        UPROPERTY(EditAnywhere) TWeakObjectPtr<AActor> Actor;
+
+        // Game thread, at snapshot time: copy the live location into Value.
+        virtual void ResolveForSnapshot() override
+        {
+            if (const AActor* A = Actor.Get()) { Value = A->GetActorLocation(); }
+        }
+        virtual bool HasValue() const override { return Actor.IsValid(); }
+        // GetValue() is inherited and returns the resolved Value, so a
+        // condition on FVectorChunk works on this chunk unchanged.
+    };
+
+    // A float that computes its value instead of storing it:
+    USTRUCT(BlueprintType)
+    struct AO_API FDecayingFloatChunk : public FFloatChunk
+    {
+        GENERATED_BODY()
+        UPROPERTY(EditAnywhere) float HalfLifeSeconds = 10.f;
+        UPROPERTY() FDateTime SetTime;
+
+        virtual float GetValue() const override
+        {
+            const double Elapsed = (FDateTime::UtcNow() - SetTime).GetTotalSeconds();
+            return Value * FMath::Pow(0.5, Elapsed / HalfLifeSeconds);
+        }
+    };
+
+    A UCondition_Float targeting FFloatChunk scores FDecayingFloatChunk through
+    the virtual GetValue() with no changes, the same way TSubclassOf<UFloatChunk>
+    accepts any UFloatChunk subclass today.
+
+
+------------------------------------------------------------------------------
+3. DATA MAP ENTRY AND CONTAINER  (Data/DataMapInterface.h)
+------------------------------------------------------------------------------
+
+CURRENT
+    USTRUCT() struct FDataMapEntry
+    {
+        UPROPERTY(EditAnywhere, Instanced) TObjectPtr<UDataChunk> Chunk;
+        bool operator==(TSubclassOf<UDataChunk>) const;     // identity = class
+    };
+    // TArray<FDataMapEntry> everywhere, with UDataMapGlobals static helpers.
+
+PROPOSED
+    USTRUCT(BlueprintType)
+    struct AO_API FDataMapEntry
+    {
+        GENERATED_BODY()
+
+        // The chunk's precise name. Tag picker in the editor, limited to Data.*
+        UPROPERTY(EditAnywhere, BlueprintReadOnly, meta = (Categories = "Data"))
+        FGameplayTag Key;
+
+        // Struct-type dropdown + inline fields in the editor (same workflow as
+        // EditInlineNew today). FInstancedStruct is used rather than
+        // TInstancedStruct<FDataChunk> because Iris has a dedicated net
+        // serializer for FInstancedStruct; BaseStruct restricts the picker.
+        UPROPERTY(EditAnywhere, BlueprintReadOnly, meta = (BaseStruct = "/Script/AO.DataChunk", ExcludeBaseStruct))
+        FInstancedStruct Chunk;
+    };
+
+    USTRUCT(BlueprintType)
+    struct AO_API FDataMap
+    {
+        GENERATED_BODY()
+
+        UPROPERTY(EditAnywhere, BlueprintReadOnly, meta = (TitleProperty = "Key"))
+        TArray<FDataMapEntry> Entries;
+
+        // Typed lookup. Returns nullptr if the key is missing OR the chunk
+        // isn't a T (or derived from T). Linear scan: maps hold ~5-20 entries,
+        // where an array beats a hash map. Can be sorted by tag later if needed.
+        template<typename T>
+        const T* Find(FGameplayTag Key) const
+        {
+            for (const FDataMapEntry& E : Entries)
+            {
+                if (E.Key == Key) { return E.Chunk.GetPtr<T>(); }
+            }
+            return nullptr;
+        }
+
+        template<typename T>
+        T* FindMutable(FGameplayTag Key)
+        {
+            for (FDataMapEntry& E : Entries)
+            {
+                if (E.Key == Key) { return E.Chunk.GetMutablePtr<T>(); }
+            }
+            return nullptr;
+        }
+
+        bool Has(FGameplayTag Key) const
+        {
+            const FDataChunk* C = Find<FDataChunk>(Key);
+            return C && C->HasValue();
+        }
+
+        // Add or overwrite. Takes the chunk by value (it's copied into the map).
+        template<typename T>
+        T& Set(FGameplayTag Key, const T& Value)
+        {
+            for (FDataMapEntry& E : Entries)
+            {
+                if (E.Key == Key) { E.Chunk.InitializeAs<T>(Value); return E.Chunk.GetMutable<T>(); }
+            }
+            FDataMapEntry& New = Entries.AddDefaulted_GetRef();
+            New.Key = Key;
+            New.Chunk.InitializeAs<T>(Value);
+            return New.Chunk.GetMutable<T>();
+        }
+
+        void SetRaw(const FDataMapEntry& Entry);    // same, for an untyped entry
+        bool Remove(FGameplayTag Key) { return Entries.RemoveAll([&](const FDataMapEntry& E) { return E.Key == Key; }) > 0; }
+        void Append(const FDataMap& Other) { for (const FDataMapEntry& E : Other.Entries) { SetRaw(E); } }
+
+        // Game thread: deep copy with world-derived values resolved.
+        FDataMap Snapshot() const
+        {
+            FDataMap Copy = *this;                                  // copies every chunk's data
+            for (FDataMapEntry& E : Copy.Entries)
+            {
+                if (FDataChunk* C = E.Chunk.GetMutablePtr<FDataChunk>()) { C->ResolveForSnapshot(); }
+            }
+            return Copy;
+        }
+    };
+
+    Note: no GetTypeHash / operator== needed. Lookups compare tags, and
+    FGameplayTag already has correct hashing if a TMap is ever wanted.
+
+
+------------------------------------------------------------------------------
+4. DATA MAP INTERFACE  (Data/DataMapInterface.h)
+------------------------------------------------------------------------------
+
+CURRENT
+    virtual const TArray<FDataMapEntry>& DataMap() = 0;
+    virtual TArray<FDataMapEntry> DataMapCopy() = 0;
+    template<class T> TObjectPtr<T> DataChunk();
+    TObjectPtr<UDataChunk> DataChunk(TSubclassOf<UDataChunk>);
+    bool HasData(TSubclassOf<UDataChunk>);
+    virtual void AddData(UDataChunk*, bool) = 0;          // Server RPCs on implementers
+    virtual void AppendData(const TArray<FDataMapEntry>&, bool) = 0;
+    virtual void RemoveData(TSubclassOf<UDataChunk>) = 0;
+
+PROPOSED
+    class AO_API IDataMapInterface
+    {
+        GENERATED_BODY()
+    public:
+        virtual const FDataMap& DataMap() const = 0;
+
+        template<typename T> const T* DataChunk(FGameplayTag Key) const { return DataMap().Find<T>(Key); }
+        bool HasData(FGameplayTag Key) const { return DataMap().Has(Key); }
+        FDataMap Snapshot() const { return DataMap().Snapshot(); }   // replaces DataMapCopy()
+
+        // Authority only. Implementers mark the property dirty for push-model
+        // replication (see section 8). No RPCs needed: AI data is changed by
+        // the host, which is the authority.
+        template<typename T> T& SetData(FGameplayTag Key, const T& Value) { T& R = MutableDataMap().Set(Key, Value); OnDataMapChanged(); return R; }
+        void SetData(const FDataMapEntry& Entry) { MutableDataMap().SetRaw(Entry); OnDataMapChanged(); }
+        void AppendData(const FDataMap& Other) { MutableDataMap().Append(Other); OnDataMapChanged(); }
+        void RemoveData(FGameplayTag Key) { if (MutableDataMap().Remove(Key)) { OnDataMapChanged(); } }
+
+        // Modify in place (for modifiers), then notify once.
+        FDataMap& EditDataMap() { return MutableDataMap(); }
+        virtual void OnDataMapChanged() {}
+
+    private:
+        virtual FDataMap& MutableDataMap() = 0;
+    };
+
+
+------------------------------------------------------------------------------
+5. MODIFIERS  (FPurposeModificationEntry, chunk AdjustData / DataModifier)
+------------------------------------------------------------------------------
+
+What modifiers do today: a purpose asset lists FPurposeModificationEntry items.
+When the purpose is SELECTED or FINISHED (selectionEvent), each entry changes a
+chunk on one subject (subjectToAdjust): FContextData::AdjustDataIfPossible ->
+AdjustData. If the subject already has a chunk of that class,
+chunk->AdjustData(modifierChunk) runs; otherwise a new chunk of that class is
+created and adjusted. The "how" is a field on the chunk itself, used only when
+the chunk sits on a purpose asset:
+    UFloatChunk:         Increase / Decrease / SetValue by the modifier's value
+    UTimeOf:             UpdateTimeToNow
+    UContextualTags:     AddTag / RemoveTag (tagForAdjustment)
+    UContextualHistory:  add or refresh a history entry
+Purposes use this to WRITE state that later purposes' conditions READ. For
+example, a purpose sets the Candidate's history to Contextual.Status.Hostile when
+selected, and Condition_SubjectIsHostile then scores it. It's the system's
+memory and state-transition mechanism.
+
+CURRENT
+    USTRUCT() struct FPurposeModificationEntry
+    {
+        EPurposeSelectionEvent selectionEvent;
+        ESubject subjectToAdjust;
+        UPROPERTY(Instanced) TObjectPtr<UDataChunk> dataAdjustment;   // a chunk whose modifier fields say what to do
+    };
+
+PROPOSED
+    USTRUCT()
+    struct AO_API FDataModifier
+    {
+        GENERATED_BODY()
+        virtual ~FDataModifier() = default;
+
+        // Apply to an existing entry, or initialize the entry if it's empty.
+        virtual void Apply(FDataMapEntry& Target) const {}
+    };
+
+    UENUM() enum class EFloatOp : uint8 { Set, Add, Subtract };
+
+    USTRUCT(meta = (DisplayName = "Float"))
+    struct AO_API FFloatModifier : public FDataModifier
+    {
+        GENERATED_BODY()
+        UPROPERTY(EditAnywhere) EFloatOp Op = EFloatOp::Set;
+        UPROPERTY(EditAnywhere) float Amount = 0.f;
+
+        virtual void Apply(FDataMapEntry& Target) const override
+        {
+            if (!Target.Chunk.IsValid()) { Target.Chunk.InitializeAs<FFloatChunk>(); }
+            FFloatChunk* F = Target.Chunk.GetMutablePtr<FFloatChunk>();
+            if (!F) { return; }                          // key exists but isn't a float: authoring error, log it
+            switch (Op)
+            {
+                case EFloatOp::Set:      F->Value  = Amount; break;
+                case EFloatOp::Add:      F->Value += Amount; break;
+                case EFloatOp::Subtract: F->Value -= Amount; break;
+            }
+        }
+    };
+
+    USTRUCT(meta = (DisplayName = "Tags"))
+    struct AO_API FTagsModifier : public FDataModifier
+    {
+        GENERATED_BODY()
+        UPROPERTY(EditAnywhere) FGameplayTagContainer Add;
+        UPROPERTY(EditAnywhere) FGameplayTagContainer Remove;
+        virtual void Apply(FDataMapEntry& Target) const override;   // init FTagsChunk if empty, then add/remove
+    };
+
+    USTRUCT(meta = (DisplayName = "History"))
+    struct AO_API FHistoryModifier : public FDataModifier
+    {
+        GENERATED_BODY()
+        UPROPERTY(EditAnywhere) FGameplayTag Entry;                // e.g. Contextual.Status.Hostile
+        virtual void Apply(FDataMapEntry& Target) const override;   // init FHistoryChunk if empty, AddOrRefresh(Entry, Now)
+    };
+
+    USTRUCT(meta = (DisplayName = "Time: Now"))
+    struct AO_API FTimeNowModifier : public FDataModifier
+    {
+        GENERATED_BODY()
+        virtual void Apply(FDataMapEntry& Target) const override;   // init FTimeChunk if empty, Value = UtcNow
+    };
+
+    USTRUCT()
+    struct AO_API FPurposeModificationEntry
+    {
+        GENERATED_BODY()
+        UPROPERTY(EditAnywhere) FText description;
+        UPROPERTY(EditAnywhere) EPurposeSelectionEvent selectionEvent = EPurposeSelectionEvent::None;
+        UPROPERTY(EditAnywhere) ESubject subjectToAdjust = ESubject::None;
+        UPROPERTY(EditAnywhere, meta = (Categories = "Data")) FGameplayTag Key;   // which chunk
+        UPROPERTY(EditAnywhere) TInstancedStruct<FDataModifier> Modifier;        // what to do (dropdown)
+    };
+
+    Runtime chunks no longer carry dataModifier / modifier / tagForAdjustment.
+
+
+------------------------------------------------------------------------------
+6. CONDITIONS  (Purpose/Condition.h + a derived condition)
+------------------------------------------------------------------------------
+
+CURRENT
+    UCLASS(Abstract, EditInlineNew, DefaultToInstanced)
+    class UCondition : public UObject
+    {
+        ESubject primarySubjectType, secondarySubjectType;
+        float weight; bool isRequired; float min, max; ...curves...
+
+        float InitiateEvaluation(const TMap<ESubject, TArray<FDataMapEntry>>& context, ...) const;
+        UFUNCTION(BlueprintNativeEvent) float EvaluateConditionInternal(const UDataChunk* primary, const UDataChunk* secondary, UPurposeAbilityComponent* owner) const;
+        UFUNCTION(BlueprintNativeEvent) TSubclassOf<UDataChunk> PrimaryData() const;
+        UFUNCTION(BlueprintNativeEvent) TSubclassOf<UDataChunk> SecondaryData() const;
+        template<class P, class S> bool RetrieveConditionDataChunks(...);   // ~3 near-duplicate overloads
+    };
+
+    class UCondition_Float : public UCondition
+    {
+        UPROPERTY() TSubclassOf<UFloatChunk> primaryDataType;
+        EConditional_Float conditional;
+    };
+
+PROPOSED
+Conditions stay UObjects. They're authored instanced inside purpose assets and
+are read-only at runtime, so that suits them. Two changes: chunks are found by
+TAG, and evaluation is a plain C++ virtual instead of a BlueprintNativeEvent,
+because Blueprint must not run on the evaluation thread. Blueprint subclasses of
+conditions are still fine for CONFIGURATION (preset tags, weights, curves);
+they just can't override the scoring logic.
+
+    // The evaluation-time view of an occurrence: one snapshot per subject.
+    // Built on the game thread, then owned by the occurrence on the worker.
+    using FSubjectData = TMap<ESubject, FDataMap>;
+
+    UCLASS(Abstract, EditInlineNew, DefaultToInstanced, CollapseCategories)
+    class AO_API UCondition : public UObject
+    {
+        GENERATED_BODY()
+    public:
+        UPROPERTY(EditAnywhere) FText description;
+        UPROPERTY(EditAnywhere) float weight = 1.f;
+        UPROPERTY(EditAnywhere) bool isRequired = false;
+        UPROPERTY(EditAnywhere) ESubject primarySubjectType = ESubject::None;
+        UPROPERTY(EditAnywhere, meta = (EditCondition = "bHasSecondSubject", EditConditionHides))
+        ESubject secondarySubjectType = ESubject::None;
+
+        UPROPERTY(EditAnywhere, meta = (Categories = "Data")) FGameplayTag PrimaryKey;     // was PrimaryData()
+        UPROPERTY(EditAnywhere, meta = (Categories = "Data", EditCondition = "bHasSecondSubject", EditConditionHides))
+        FGameplayTag SecondaryKey;   // empty = same key as primary, read from the secondary subject
+        // ... min / max / curves unchanged ...
+
+        // Worker-thread safe: only reads the snapshot and this condition's own properties.
+        float InitiateEvaluation(const FSubjectData& Data) const { return Evaluate(Data); }
+
+    protected:
+        virtual float Evaluate(const FSubjectData& Data) const PURE_VIRTUAL(UCondition::Evaluate, return 0.f;);
+
+        // Replaces the RetrieveConditionDataChunks overloads.
+        template<typename T>
+        const T* GetChunk(const FSubjectData& Data, ESubject Subject, FGameplayTag Key) const
+        {
+            const FDataMap* Map = Data.Find(Subject);
+            return Map ? Map->Find<T>(Key) : nullptr;
+        }
+        template<typename T> const T* Primary(const FSubjectData& Data) const   { return GetChunk<T>(Data, primarySubjectType, PrimaryKey); }
+        template<typename T> const T* Secondary(const FSubjectData& Data) const
+        {
+            const ESubject S = secondarySubjectType != ESubject::None ? secondarySubjectType : primarySubjectType;
+            return GetChunk<T>(Data, S, SecondaryKey.IsValid() ? SecondaryKey : PrimaryKey);
+        }
+
+        UPROPERTY(EditDefaultsOnly) bool bHasSecondSubject = true;
+    };
+
+    UCLASS()
+    class AO_API UCondition_Float : public UCondition
+    {
+        GENERATED_BODY()
+    public:
+        UPROPERTY(EditAnywhere) EConditional_Float conditional = EConditional_Float::ScoreValueAlongCurve;
+
+    protected:
+        virtual float Evaluate(const FSubjectData& Data) const override
+        {
+            const FFloatChunk* P = Primary<FFloatChunk>(Data);   // also matches FDecayingFloatChunk etc.
+            if (!P) { return 0.f; }
+            switch (conditional)
+            {
+                case EConditional_Float::ScoreValueAlongCurve: return P->GetValue();
+                default:                                       return 0.f;
+            }
+        }
+    };
+
+    UCLASS()
+    class AO_API UCondition_Distance : public UCondition       // example two-subject condition
+    {
+        GENERATED_BODY()
+    protected:
+        virtual float Evaluate(const FSubjectData& Data) const override
+        {
+            const FVectorChunk* A = Primary<FVectorChunk>(Data);     // FActorLocationChunk qualifies
+            const FVectorChunk* B = Secondary<FVectorChunk>(Data);
+            return (A && B) ? FVector::Dist(A->GetValue(), B->GetValue()) : 0.f;
+        }
+    };
+
+
+------------------------------------------------------------------------------
+7. OCCURRENCE / CONTEXT DATA  (Purpose/PurposeEvaluationThread.h)
+------------------------------------------------------------------------------
+
+CURRENT
+    struct FSubjectMap
+    {
+        TMap<ESubject, TScriptInterface<IDataMapInterface>> subjects;
+        // Called inside the worker (PurposeEvaluationThread.cpp:200); copies POINTERS.
+        TMap<ESubject, TArray<FDataMapEntry>> GetSubjectsAsDataMaps() const;
+    };
+    struct FContextData
+    {
+        FPurpose purpose; FSubjectMap subjectMap; TArray<FDataMapEntry> contextData;
+        bool AdjustData(ESubject target, const TObjectPtr<UDataChunk>& adjustmentChunk) const;
+        void AdjustDataIfPossible(const TArray<FPurposeModificationEntry>&, EPurposeSelectionEvent, ...) const;
+    };
+
+PROPOSED
+    struct FSubjectMap
+    {
+        UPROPERTY() TMap<ESubject, TScriptInterface<IDataMapInterface>> subjects;   // live objects, game thread only
+
+        // GAME THREAD, when the occurrence is raised (PurposeSystem::Occurrence),
+        // before it's queued. Produces the data the worker evaluates.
+        FSubjectData Snapshot(const FDataMap& ContextData) const
+        {
+            FSubjectData Out;
+            for (const TPair<ESubject, TScriptInterface<IDataMapInterface>>& S : subjects)
+            {
+                if (S.Value.GetObject() && IsValid(S.Value.GetObject()))
+                {
+                    Out.Add(S.Key, S.Value->Snapshot());
+                }
+            }
+            Out.Add(ESubject::Context, ContextData.Snapshot());   // Context becomes an ordinary subject
+            return Out;
+        }
+    };
+
+    struct FOccurrence
+    {
+        TArray<TWeakObjectPtr<UPurposeAbilityComponent>> candidates;   // weak: worker never keeps them alive
+        FSubjectMap subjectMap;                                       // for performing the result on the game thread
+        FSubjectData snapshot;                                        // what conditions read
+        // Candidate data: each candidate's own snapshot, added to snapshot
+        // under ESubject::Candidate per candidate during evaluation.
+        TMap<TWeakObjectPtr<UPurposeAbilityComponent>, FDataMap> candidateSnapshots;
+    };
+
+    struct FContextData
+    {
+        FPurpose purpose; FSubjectMap subjectMap;
+        UPROPERTY() FDataMap contextData;                              // was TArray<FDataMapEntry>
+
+        // Game thread. Live data, not the snapshot.
+        void ApplyModifier(const FPurposeModificationEntry& Mod)
+        {
+            const FDataModifier* M = Mod.Modifier.GetPtr<FDataModifier>();
+            if (!M || !Mod.Key.IsValid()) { return; }
+
+            FDataMap* Target = nullptr;
+            IDataMapInterface* Owner = nullptr;
+            if (Mod.subjectToAdjust == ESubject::Context)       { Target = &contextData; }
+            else if (IDataMapInterface* I = DataMapInterfaceForSubject(Mod.subjectToAdjust)) { Owner = I; Target = &I->EditDataMap(); }
+            if (!Target) { return; }
+
+            // Find or add the entry, then let the modifier apply/initialize it.
+            FDataMapEntry* Entry = Target->Entries.FindByPredicate([&](const FDataMapEntry& E) { return E.Key == Mod.Key; });
+            if (!Entry) { Entry = &Target->Entries.AddDefaulted_GetRef(); Entry->Key = Mod.Key; }
+            M->Apply(*Entry);
+            if (Owner) { Owner->OnDataMapChanged(); }
+        }
+
+        void ApplyModifiers(EPurposeSelectionEvent Event)
+        {
+            for (const FPurposeModificationEntry& Mod : purpose.DataAdjustments())
+            {
+                if (Mod.selectionEvent == Event) { ApplyModifier(Mod); }
+            }
+        }
+    };
+
+    // The context-subject special case in today's AdjustData (which couldn't
+    // create chunks for Context because a UObject chunk needs an outer)
+    // disappears: structs need no outer.
+
+
+------------------------------------------------------------------------------
+8. PURPOSE ABILITY COMPONENT  (Purpose/PurposeAbilityComponent.h/.cpp)
+------------------------------------------------------------------------------
+
+CURRENT
+    UPROPERTY(Replicated) TArray<FDataMapEntry> data;
+    // DOREPLIFETIME(UPurposeAbilityComponent, data);   commented out
+    UFUNCTION(Server, Reliable) void AddData(UDataChunk*, bool);  ...
+    contextData.Add(FDataMapEntry(NewObject<UTimeOfOccurrence>(this)));
+
+PROPOSED (Iris + push model)
+    // .h
+    UPROPERTY(Replicated, EditAnywhere) FDataMap data;
+    virtual const FDataMap& DataMap() const override { return data; }
+    virtual void OnDataMapChanged() override { MARK_PROPERTY_DIRTY_FROM_NAME(UPurposeAbilityComponent, data, this); }
+  private:
+    virtual FDataMap& MutableDataMap() override { return data; }
+
+    // .cpp
+    #include "Net/UnrealNetwork.h"                 // DOREPLIFETIME lives here
+    #include "Net/Core/PushModel/PushModel.h"      // MARK_PROPERTY_DIRTY_*
+
+    void UPurposeAbilityComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& Out) const
+    {
+        Super::GetLifetimeReplicatedProps(Out);
+        FDoRepLifetimeParams Params;
+        Params.bIsPushBased = true;
+        DOREPLIFETIME_WITH_PARAMS_FAST(UPurposeAbilityComponent, data, Params);
+    }
+
+    // Raising an occurrence (was NewObject<UTimeOfOccurrence>):
+    FDataMap contextData = CurrentBehavior().contextData;
+    contextData.Set(TAG_Data_Time_Occurrence, FTimeChunk{});    // FTimeChunk defaults to UtcNow
+
+    Iris uses the same UPROPERTY(Replicated) + GetLifetimeReplicatedProps
+    declarations as generic replication; it changes what happens behind them.
+    Each FInstancedStruct entry goes through Iris's InstancedStructNetSerializer
+    (type + fields). If per-AI maps change often, FDataMap can later become an
+    FFastArraySerializer (like Lyra's FGameplayTagStackContainer,
+    LyraGame/System/GameplayTagStack.h) so only changed entries are sent.
+
+    Sending chunks in an RPC (delegated brain) works the same way: an RPC
+    parameter of FDataMap or FDataMapEntry serializes by value.
+
+
+------------------------------------------------------------------------------
+9. OTHER DATA MAP HOLDERS  (AISpawner, AIActivity, sequence tasks)
+------------------------------------------------------------------------------
+
+CURRENT (AAISpawner constructor)
+    UActorRole* roleChunk = CreateDefaultSubobject<UActorRole>("UActorRole");
+    roleChunk->roles.Add(FRoleEntry(EActorRole::AI));
+    data.Add(FDataMapEntry(roleChunk));
+    UActorLocation& locationChunk = CreateDefaultSubobject<UActorLocation>("UActorLocation")->Initialize(this);
+    data.Add(FDataMapEntry(&locationChunk));
+
+PROPOSED
+    UPROPERTY(EditAnywhere, Category = "Group Spawn Params") FDataMap data;
+
+    AAISpawner::AAISpawner()
+    {
+        FRolesChunk Roles;                         // value struct with TArray<EActorRole>
+        Roles.Value.Add(EActorRole::AI);
+        data.Set(TAG_Data_Role, Roles);
+
+        FActorLocationChunk Location;
+        Location.Actor = this;
+        data.Set(TAG_Data_Location, Location);
+    }
+    // Also replaces the spawner's separate Instanced TArray<UDataChunk*> dataChunks:
+    // one FDataMap, edited in the details panel.
+
+CURRENT (sequence tasks, e.g. AT_MoveTo)
+    UPROPERTY(...) TArray<FDataMapEntry> dataMap;    // plus the 7-function interface boilerplate per task
+
+PROPOSED
+    UPROPERTY(EditAnywhere) FDataMap dataMap;
+    virtual const FDataMap& DataMap() const override { return dataMap; }
+  private:
+    virtual FDataMap& MutableDataMap() override { return dataMap; }
+    // (2 overrides per task instead of 7; tasks don't replicate, so OnDataMapChanged stays empty)
+
+
+------------------------------------------------------------------------------
+10. TASK DATA HAND-OFF  (FTaskAndDataPair, AI_SequentialActions::PerformTask)
+------------------------------------------------------------------------------
+
+CURRENT
+    struct FTaskAndDataPair
+    {
+        ESubject subjectToRetrieveFrom;
+        TSubclassOf<UDataChunk> dataToRetrieve;
+        TSubclassOf<UDataChunk> dataToModify;
+    };
+    UDataChunk* chunkToAdjust = Cast<IDataMapInterface>(task)->DataChunk(adjustment.dataToModify);
+    UDataChunk* source = ...DataChunk(..., adjustment.dataToRetrieve);
+    chunkToAdjust->CopyDataFrom(source);          // per-class virtual copy with type checks
+
+PROPOSED
+    struct FTaskAndDataPair
+    {
+        UPROPERTY(EditAnywhere) ESubject subjectToRetrieveFrom = ESubject::Context;
+        UPROPERTY(EditAnywhere, meta = (Categories = "Data")) FGameplayTag dataToRetrieve;
+        UPROPERTY(EditAnywhere, meta = (Categories = "Data")) FGameplayTag dataToModify;
+    };
+
+    // in PerformTask (game thread, live data):
+    const FDataMapEntry* Source = FindEntry(adjustment.subjectToRetrieveFrom, adjustment.dataToRetrieve);
+    if (Source && Source->Chunk.IsValid())
+    {
+        FDataMapEntry Copy = *Source;
+        Copy.Key = adjustment.dataToModify;       // same data, stored under the task's key
+        TaskDataMap->SetData(Copy);               // CopyDataFrom() no longer needed: struct copy
+    }
+
+    // AttemptToAppendTaskDataToContextData becomes:
+    ContextDataForBehavior().Append(TaskDataMap);   // Set() already replaces matching keys
+
+
+------------------------------------------------------------------------------
+11. PURPOSE DEFINITIONS  (UEventAsset, FPurpose): mostly unchanged
+------------------------------------------------------------------------------
+
+    UCLASS() class UEventAsset : public UDataAsset { UPROPERTY(EditAnywhere) FPurpose eventPurpose; };
+
+    FPurpose keeps: Instanced TArray<UCondition*> conditions, Instanced behaviorAbility.
+    It changes: dataAdjustmentsForPurposeEvents -> TArray<FPurposeModificationEntry> (section 5).
+
+    Purposes are read-only definitions shared by every AI, which is what a
+    data asset is for. A data asset that is hard-referenced loads with whatever
+    references it; manual load/unload only comes from the Asset Manager
+    (GetPrimaryAssetId + soft references), which is optional. If Lyra-style
+    discovery isn't needed, drop the GetPrimaryAssetId override and reference
+    purposes directly.
+
+
+------------------------------------------------------------------------------
+12. TAGS
+------------------------------------------------------------------------------
+
+    // One place for native keys used from C++ (Data/DataTags.h):
+    UE_DECLARE_GAMEPLAY_TAG_EXTERN(TAG_Data_Location);
+    UE_DECLARE_GAMEPLAY_TAG_EXTERN(TAG_Data_Role);
+    UE_DECLARE_GAMEPLAY_TAG_EXTERN(TAG_Data_Time_Occurrence);
+    UE_DECLARE_GAMEPLAY_TAG_EXTERN(TAG_Data_History);
+    // Designer-only keys (Data.Patrol.LeaderCount, Data.Status.Alarm) are
+    // added in Project Settings > Gameplay Tags; no C++ or Blueprint class needed.
+
+
+------------------------------------------------------------------------------
+SUMMARY OF WHAT CHANGES
+------------------------------------------------------------------------------
+
+    Thing                       Now                                   Proposed
+    --------------------------  ------------------------------------  -------------------------------------------
+    Chunk                       UObject (UDataChunk), GC'd            USTRUCT value (FDataChunk), no GC
+    Chunk identity / name       UClass (often a BP subclass)          FGameplayTag key
+    Chunk logic                 C++ virtuals, BP subclasses           C++ virtuals on structs (no BP logic)
+    DataMap                     TArray<FDataMapEntry{UObject*}>       FDataMap{TArray<{Tag, FInstancedStruct}>}
+    Copy                        DuplicateObject per chunk             plain copy
+    Worker-thread data          pointers to live chunks               snapshot taken on game thread
+    World-derived values        read live on worker (actor->Get...)   resolved at snapshot (ResolveForSnapshot)
+    Modifiers                   fields on every chunk                 TInstancedStruct<FDataModifier> on the entry
+    Condition data selection    TSubclassOf<UDataChunk>               FGameplayTag + base struct type in code
+    Condition logic             BlueprintNativeEvent (can be BP)      C++ virtual only (BP for config only)
+    Replication                 UObject subobjects (unwired)          struct by value, Iris serializer, push model
+    RPC                         not possible by value                 by value

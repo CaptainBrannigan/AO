@@ -2,11 +2,13 @@
 
 Everything about AI: the Purpose (utility AI) system's design and behavior, its performance, networking, and rendering AI at scale.
 
-**Source:** the Purpose system currently lives in the Lyra Warzone plugin: `C:\Dev\Epic Games\UnrealEngine\Samples\Games\Lyra\Plugins\GameFeatures\Warzone\Source\WarzoneRuntime\Public\Purpose\`.
+**Source:** the Purpose system now lives in the AO module: `C:\Dev\AO\AO\Source\AO\Purpose\` (plus `Data\`, `DataChunks\`, `Abilities\`). It was ported from the Lyra Warzone plugin (`C:\Dev\Epic Games\UnrealEngine\Samples\Games\Lyra\Plugins\GameFeatures\Warzone\`) and compiles in AO as of 2026-10-27.
 
 ## Goal
 
 DMZ-style density: many AI that stay interesting, in player-hosted sessions where the host's hardware is the limit. Every section below is weighed against that.
+
+- **Delegated AI decision-making:** the first player in an area runs the decision-making for that area's AI, to take load off the host. See "Networking" → "Delegated AI decision-making".
 
 ## Current direction
 
@@ -258,6 +260,23 @@ Also worth an A/B once animation is in: Update Rate Optimization and AnimationSh
 **Next runs:** tick off + shadows off (fixed cost floor); then animated with *Use Animation Asset* (pure evaluation + skinning), then an Animation Blueprint (its overhead), with Update Rate Optimizations / *Visibility Based Anim Tick Option* A/B.
 
 ## Networking
+
+### Delegated AI decision-making (goal)
+
+**Goal:** in a large open world on a listen server, the first player in an area runs the decision-making for the AI in that area, so the host isn't paying for every AI's decisions.
+
+**Constraint:** Unreal has no client authority over replicated actors. Every replicated actor has one authority, the server (the host on a listen server); a client can at most *own* an actor, which lets it send Server RPCs through it. GAS's `NetExecutionPolicy` only chooses where an ability runs within that model; for an AI with no owning player, "local" and "server" are both the host. So this is a custom layer above the engine's replication, whatever execution policy the abilities use.
+
+**Design: a delegated brain.** The AI stays authoritative on the host, but its *decision-making* runs on an assigned client. That client runs the Purpose evaluation, EQS and perception for the AI near it and sends the chosen behavior and targets to the host through RPCs on an actor it owns (its PlayerController, or a per-area relay actor). The host executes the result: movement, pathing, abilities and replication.
+
+- **What it saves:** the decision side, which is where the Purpose and EQS cost is.
+- **What it doesn't save:**
+  - The host still runs CharacterMovement, nav path following and animation for every AI.
+  - The host still pays the replication cost for every AI to every client. On a listen server, the host's *upload bandwidth* is often the real limit, and delegating the brains doesn't reduce it, because all state still goes out through the host. Measure first (viability tests C and F in [Engine.md](Engine.md)): if bandwidth runs out before host CPU, delegation doesn't help and the effort belongs in Iris relevance and update rates.
+- **Trust: accepted.** The assigned client chooses AI behavior, so a modified client could, for example, make the AI passive. On a listen server the host can already cheat freely, and no anti-cheat has solved cheating, so extending similar latitude to clients is accepted rather than defended against (see [Networking.md](Networking.md) → "Community moderation"). Server-side sanity checks on the decisions the host executes still apply.
+- **Handoff:** when the assigned client dies, leaves or walks away, another client in the area or the host takes over. Needs hysteresis so assignment doesn't flip back and forth at area boundaries.
+- **Latency:** decisions arrive one RPC round-trip late. Fine for AI decisions, but a constraint on anything reactive.
+- **GAS:** GAS assumes AI abilities run on the authority. The client-side brain runs Purpose evaluation outside GAS and sends *decisions* (purpose/behavior identifier plus targets), not ability activations; the host then activates the ability as it does today. Keep Purpose abilities `ReplicateNo` / `ServerOnly` on the host; that doesn't block this design.
 
 ### Purpose system across client-authoritative regions
 

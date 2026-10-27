@@ -181,7 +181,23 @@
                     {
                         "Name":  "EditorTelemetry",
                         "Enabled":  false
-                    }
+                    },
+					          {
+						          "Name": "GameplayAbilities",
+						          "Enabled": true
+					          },
+					          {
+						          "Name": "ModularGameplay",
+						          "Enabled": true
+					          },
+					          {
+						          "Name": "PCG",
+						          "Enabled": true
+					          },
+					          {
+						          "Name": "EditorScriptingUtilities",
+						          "Enabled": true
+					          }
                 ],
     "TargetPlatforms":  [
                             "Windows",
