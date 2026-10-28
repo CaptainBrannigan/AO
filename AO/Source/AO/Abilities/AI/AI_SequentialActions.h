@@ -11,9 +11,6 @@
 #include "DataChunks/ContextualTags.h"
 #include "AI_SequentialActions.generated.h"
 
-UCLASS()
-class UBehaviorTags : public UContextualTags { GENERATED_BODY() };
-
 UCLASS(MinimalAPI)
 /// This AI behavior 
 class UAI_SequentialActions : public UBehavior_AI
@@ -68,7 +65,7 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Behavior Data", DisplayName = "Sequential Actions", meta = (TitleProperty=description))
 		TArray<FActionSequenceEntry> sequenceOfActions;
 
-	TArray<FDataMapEntry>& ContextDataForBehavior() { return Vessel()->CurrentBehavior().contextData; }
+	FDataMap& ContextDataForBehavior() { return Vessel()->CurrentBehavior().contextData; }
 
 protected:
 
@@ -80,5 +77,5 @@ protected:
 		///TArray<FActionEntry> taskDuplicatesForCurrentAction;
 		TArray<TObjectPtr<UGameplayTask>> taskDuplicatesForCurrentAction;
 
-	void AttemptToAppendTaskDataToContextData(const TArray<FDataMapEntry>& dataToAppend);
+	void AttemptToAppendTaskDataToContextData(const FDataMap& dataToAppend);
 };

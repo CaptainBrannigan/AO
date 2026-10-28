@@ -3,6 +3,8 @@
 #pragma once
 
 #include "Data/Data.h"
+#include "Data/DataMapInterface.h"
+#include "Data/DataTags.h"
 #include "Misc/Timespan.h"
 #include "NativeGameplayTags.h"
 #include "Data/GlobalLog.h"
@@ -13,7 +15,7 @@ struct FContextHistoryEntry
 {
 	GENERATED_BODY()
 
-	FContextHistoryEntry() 
+	FContextHistoryEntry()
 	{
 		contextualTag = FGameplayTag();
 		timeOfContext = 0.0f;
@@ -24,11 +26,10 @@ struct FContextHistoryEntry
 		timeOfContext(inTimeOfBehavior)
 	{}
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly)
-	//TSubclassOf<class UGA_Behavior> behavior = nullptr;
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Data")
 	FGameplayTag contextualTag;
 
-	UPROPERTY(BlueprintReadOnly)
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Data")
 	FDateTime timeOfContext = 0.0f;
 
 	FORCEINLINE bool operator ==(const FContextHistoryEntry& other) const
@@ -40,50 +41,38 @@ struct FContextHistoryEntry
 	{
 		return contextualTag == inTag;
 	}
-
-	/*FORCEINLINE bool operator ==(const TObjectPtr<AActor> inKnownLocation) const
-	{
-		return lastLocationOfPlayer == inKnownLocation;
-	}*/
 };
-FORCEINLINE uint32 GetTypeHash(const FContextHistoryEntry& b)
-{
-	return FCrc::MemCrc32(&b, sizeof(FContextHistoryEntry));
-}
 
-UCLASS(MinimalAPI)
+USTRUCT(BlueprintType, meta = (DisplayName = "Contextual History"))
 /// <summary>
-/// Contextual history holds context FGameplayTags with a time, establishing a timeline of context conditions may query
+/// Contextual history holds context FGameplayTags with a time, establishing a timeline of context conditions may query (Data.ContextualHistory)
 /// Context can be any gameplay tag, from input tags to positional tags
 /// </summary>
-class UContextualHistory : public UDataChunk
+///Design: GAS GameplayTags Cues History; Part of this history is "what is this actor doing right now" (Contextual.Position.Cover.Moving), which is what ASC loose/owned tags are for
+/// Tags with a duration (engaged for 5s) map to a GameplayEffect with a duration that grants the tag, removing the need for time math in conditions
+/// The "how long ago" half (TimeSinceNow) has no GAS equivalent, so this chunk stays for that
+struct AO_API FContextualHistoryChunk : public FDataChunk
 {
 	GENERATED_BODY()
-public:
 
-	UContextualHistory() {}
+	FContextualHistoryChunk() : FDataChunk(TAG_Data_ContextualHistory) {}
 
-	///Overload this to require new object arguments
-	UContextualHistory& Initialize()
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Data")
+	TArray<FContextHistoryEntry> contextualHistory;
+
+	const TArray<FContextHistoryEntry>& Value() const { return contextualHistory; }
+
+	/// @return nullptr if the tag is not in the history
+	const FContextHistoryEntry* Value(FGameplayTag inContextualTag) const
 	{
-		return *this;
-	}
-
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly)
-		TArray<FContextHistoryEntry> contextualHistory;
-
-	TArray<FContextHistoryEntry> Value() const { return contextualHistory; }
-	FContextHistoryEntry Value(FGameplayTag inContextualTag) const 
-	{ 
 		for (int i = contextualHistory.Num() -1; i >= 0 ; --i)/// Work through history backwards, as newest behaviors are last in array
 		{
-			if (contextualHistory[i].contextualTag.MatchesTagExact(inContextualTag)) { return contextualHistory[i]; }/// Return the first entry that's found
+			if (contextualHistory[i].contextualTag.MatchesTagExact(inContextualTag)) { return &contextualHistory[i]; }/// Return the first entry that's found
 		}
 
-		return FContextHistoryEntry();
+		return nullptr;
 	}
 
-	UFUNCTION(BlueprintCallable)
 	void AddToValue(FGameplayTag inContextualTag)
 	{
 		AddToValue(inContextualTag, FDateTime::UtcNow());
@@ -91,10 +80,6 @@ public:
 
 	void AddToValue(FGameplayTag inContextualTag, FDateTime inTimeOfBehavior)
 	{
-		/*if (contextualHistory.Num() > 0 && contextualHistory[0].timeOfContext.GetTotalSeconds() / 100000 > 5) /// Todo: Time BehaviorHistory; Solve why Timespan is 100k over valued
-		{
-			contextualHistory.RemoveAt(0, 1, true);/// Remove the first and oldest entry
-		}*/
 		int behaviorIndex = contextualHistory.IndexOfByKey(inContextualTag);
 		if (behaviorIndex != INDEX_NONE)
 		{
@@ -108,66 +93,61 @@ public:
 		}
 	}
 
-	/// Override this method so that datachunks specified in a purpose asset may be modified when purpose is selected
-	/// @param modificationContext: What purpose selection event will lead to this data modification
-	/// @param inModifier: The encapsulated modifier specified on the derived DataChunks class
-	TObjectPtr<UDataChunk> AdjustData(const UDataChunk& inModifier) final
-	{
-		if (!inModifier.IsA<UContextualHistory>())
-		{
-			Global::Log(DATADEBUG, LogData, "UContextualTags", "AdjustData", TEXT("Provided a non-ContextualTags modifier chunk."));
-			return this;
-		}
-
-		/// We only add to value as this contextual history is time based
-		AddToValue(Cast<UContextualHistory>(&inModifier)->GetTagForAdjustment(contextualHistory));
-
-		return this;
-	}
-
-	virtual FGameplayTag GetTagForAdjustment(const TArray<FContextHistoryEntry>& currentContextualHistoryForCandidate) const { return tagForAdjustment; }
-
 	///Important for use with DataMapInterface HasData() in determining if a DataChunk can be accessed
-	///Override this with determination of whether a value has been set for this chunk or not
-	bool HasValue() final
+	bool HasValue() const override
 	{
-		//return contextualHistory.Num() > 0;
 		return true;/// Because this chunk's array is always valid, we can consider it has a modifiable value
 		/// Otherwise HasData() will always return false and we won't be able to adjust the chunk after those checks
 	}
 
-	bool HasValue(FGameplayTag inContextualTag) 
+	bool HasValue(FGameplayTag inContextualTag) const
 	{
-		if (HasValue())
-		{
-			for (const FContextHistoryEntry& entry : contextualHistory)
-			{
-				if (entry.contextualTag.MatchesTagExact(inContextualTag)) { return true; }
-			}
-		}
-		return false;
+		return Value(inContextualTag) != nullptr;
 	}
 
-	///Override this to provide more detailed information about a data chunk
-	///Call Super::Description() to include string about EDataType
-	FString Description() const final
+	FString Description() const override
 	{
 		FString history;
 
-		for (auto& entry : contextualHistory)
+		for (const FContextHistoryEntry& entry : contextualHistory)
 		{
 			history += FString::Printf(TEXT("%s. Time of: %s; "), (entry.contextualTag.IsValid() ? *entry.contextualTag.ToString() : TEXT("Invalid Behavior Input")), *entry.timeOfContext.ToString());
 		}
 
-		return Super::Description() + TEXT("Behaviors: ") + history;
+		return FDataChunk::Description() + TEXT("Behaviors: ") + history;
 	}
+};
 
-	///If implicit conversion is desired
-	//operator insertdatatype() { return instertvaluemember; }
-protected:
+USTRUCT(BlueprintType, meta = (DisplayName = "Contextual History"))
+/// Adds a tag to (or refreshes its time in) a subject's contextual history. Creates the history if the subject doesn't have one
+struct AO_API FContextualHistoryModifier : public FDataModifier
+{
+	GENERATED_BODY()
 
 	UPROPERTY(EditAnywhere, Category = "Data Adjustment")
-		/// Tag to add to the history of context
-		FGameplayTag tagForAdjustment;
+	/// Tag to add to the history of context
+	FGameplayTag tagForAdjustment;
 
+	/// Override in derived modifiers to choose the tag from the current history (see FContextualHistoryModifier_Engaged)
+	virtual FGameplayTag GetTagForAdjustment(const FContextualHistoryChunk& currentContextualHistoryForCandidate) const { return tagForAdjustment; }
+
+	bool Apply(FDataMap& map, FGameplayTag key) const override
+	{
+		FContextualHistoryChunk* history = map.FindOrAdd<FContextualHistoryChunk>(key);
+		if (!history)
+		{
+			return false;
+		}
+
+		const FGameplayTag tag = GetTagForAdjustment(*history);
+		if (!tag.IsValid())
+		{
+			return false;
+		}
+
+		history->AddToValue(tag);/// We only add to value as this contextual history is time based
+		return true;
+	}
+
+	FString Description() const override { return TEXT("Add ") + tagForAdjustment.ToString(); }
 };

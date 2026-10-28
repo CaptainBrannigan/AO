@@ -1,6 +1,13 @@
 DATACHUNKS AS STRUCTS: BASELINE STRUCTURE
 ==========================================
 
+SUPERSEDED (2026-10-27): the conversion is now in the code. Differences from this sketch:
+  - The key lives on the chunk (FDataChunk::Key), not on FDataMapEntry, so it can never disagree with the chunk.
+    Named chunk types (FMoraleChunk, FActorLocationChunk...) set their key in their constructor.
+  - Conditions read an FSubjectDataView (pointers into the occurrence's snapshots) rather than a TMap copy.
+  - Modifiers are Apply(FDataMap&, Key), so they can create the chunk under the right key.
+  - FAttributeChunk bridges float chunks to GameplayAttributes.
+
 Illustrative code for comparing structure, not compiled. Logging, comments and
 edge-case handling from the current code are left out so the shape is visible.
 Each section shows CURRENT (abbreviated) then PROPOSED.

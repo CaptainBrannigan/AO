@@ -16,6 +16,9 @@
 
 UENUM()
 ///These priorities are strictly for AI logic
+///Design: GAS Tags Priority Cancel; Priority + EndAbilitiesOf(class) is a hand-built version of GAS ability tags
+/// Give behaviors AbilityTags (Behavior.Combat, Behavior.Idle) and use CancelAbilitiesWithTag / BlockAbilitiesWithTag on the higher priority ones,
+/// then EndAbilitiesOf becomes CancelAbilities(&WithTags) and overlapping-resource logic can be data instead of code
 enum class EAbilityPriority : uint8
 {
 	Lowest = 0,
@@ -98,6 +101,8 @@ public:
 	const FTimespan TimeAbilityWasActivated() { return timeOfAbilityActivation; }
 
 	/// @return bool: True when the Ability has not reached it's minimum time of being activated to begin + a buffer or past the minimum time to allow a ability to be performed once begun
+	///Design: GAS Tags Interruption GameplayEffects; The uninterruptable window (actionMinTime) can be a duration GameplayEffect granting State.Committed on activation
+	/// New behaviors then list State.Committed in ActivationBlockedTags, and purpose scoring can skip candidates that have it (snapshot the owned tags)
 	bool AbilityIsInterruptable()
 	{
 		return (FTimespan(FDateTime::UtcNow().GetTicks()).GetTotalSeconds() - TimeAbilityWasActivated().GetTotalSeconds()) < (reactionMinTime * 3) /// Multiply minimum reaction to give AI time to visibly begin Ability

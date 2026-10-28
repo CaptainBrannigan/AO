@@ -3,25 +3,19 @@
 #pragma once
 
 #include "FloatChunk.h"
+#include "Data/DataTags.h"
 #include "Morale.generated.h"
 
-UCLASS(MinimalAPI)
+USTRUCT(BlueprintType, meta = (DisplayName = "Morale"))
 /// <summary>
 /// Effectively a health indicator
+/// A named float: selecting this type fills in its key (Data.Morale) and a default of 100
 /// </summary>
-class UMorale : public UFloatChunk
+///Design: GAS Attributes Morale Health; Morale is the strongest attribute candidate, it behaves like health
+/// As an attribute, damage/suppression GameplayEffects lower it, regen is a periodic effect, and clamping lives in PreAttributeChange
+struct AO_API FMoraleChunk : public FFloatChunk
 {
 	GENERATED_BODY()
-public:
 
-	///If implicit conversion is desired
-	//operator insertdatatype() { return instertvaluemember; }
-
-	/// While it can not be overloaded, this method will provide datachunks the opportunity to access their outer object and potentially initialize themselves from there
-	UDataChunk& NonOverloadInitialize() final
-	{
-		value = 100.0f;
-
-		return *this;
-	}
+	FMoraleChunk() : FFloatChunk(TAG_Data_Morale, 100.0f) {}
 };

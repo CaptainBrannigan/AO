@@ -40,6 +40,188 @@ Originally proposed: cascade nearby-AI reactions off the target AI's own reactio
 
 Destruction and other world changes should raise occurrences too: a building breaking creates new sightlines, cover and paths that AI should react to (relevant to the project's EQS cover/flank queries). These must be keyed off the **server-side** discrete event, never off client-local cosmetic state. See [Physics.md](Physics.md).
 
+## Design: occurrence to reaction with GAS (proposed)
+
+This section describes how an occurrence should travel from "something happened" to an AI reacting. GAS covers what it already does well: state, quantities, timed effects, gating, cooldowns and cosmetic replication. The Purpose system keeps what GAS has no answer to: scoring, "how long ago", and subjects. Proposed 2026-10-28; none of it is implemented yet.
+
+### Principles
+
+- **Behavior is defined by the conditions we can establish, and intents are the vocabulary for them.** An intent should be broad enough to be its own consideration (taking cover is a different decision from flanking) and narrow enough that designers aren't buried in variants. Conditions and references refine an intent; they don't multiply it. The code should make adding an intent cheap and adding a variant of one unnecessary.
+- **Intent and reference are the primary pair; phase is secondary.** "Cover, from the Instigator" is the decision. Seeking, Moving and AtLocation only track progress on it.
+- **Others read the past and the perceivable present, never the future.** An AI's intent and its upcoming tasks are private. Other AI learn them only by observing (it's moving, it's behind that wall) or by being told (an announcement). Nothing reads the upcoming tasks of a sequence.
+- **Each kind of fact has one home.** Tags say what kind, attributes say how much, history says when, and subjects say who and where. `Contextual.Combat.Engaged.1–5` broke this by storing a count as a category.
+- **Use GAS where it already solves the problem; keep the Purpose system where GAS has no equivalent.** GAS has no utility scoring, no "how long ago", and no subjects beyond source and target.
+
+### Tag vocabulary
+
+Top-level namespaces, split by how long a tag lasts and who can see it. These replace `Contextual.*`.
+
+| Namespace | Meaning | Lifetime | Lives on | Visible to others |
+|---|---|---|---|---|
+| `State.*` | True right now | Removed when it stops being true | ASC owned tags: loose, granted by a duration GE, or `ActivationOwnedTags` | Yes, when perceived |
+| `Event.*` | Something happened | An instant; stamped into history with a time | The occurrence's type, `FGameplayEventData::EventTag`, history entries | Only to those who perceived it |
+| `Intent.*` | What a behavior is for | While the behavior runs, then an intent history entry | The behavior ability's asset tags (formerly `AbilityTags`); intent history | No, except through an announcement |
+| `Action.*` | What a task is physically doing | While the task runs | The task's description (`contextualTagForTask`) | Only through its effects (moving, firing) |
+| `Cooldown.*` | Can't do X yet | The cooldown GE's duration | ASC owned tags | No |
+| `Data.*` | Chunk keys | n/a | `DataTags.h` | n/a |
+
+Examples:
+- **State:**
+  - `State.Position.Seeking` / `Moving` / `AtLocation`. The only three phase tags.
+  - `State.Combat.Engaged` / `UnderFire` / `Suppressed`.
+  - `State.Health.Wounded` / `Downed`.
+- **Event:**
+  - `Event.Damage.Received`, `Event.Weapon.Fired`.
+  - `Event.Perception.Sighted` / `Lost` / `Heard` / `Movement`.
+  - `Event.Announce`, `Event.Behavior.Finished`, `Event.World.Destruction`.
+- **Intent:** `Intent.Cover`, `Flank`, `Overwatch`, `Advance`, `Fallback`, `Regroup`, `Investigate`, `Patrol`, `Ambush`, `Suppress`.
+- **Action:** `Action.Move`, `Action.Face`, `Action.Animate`, `Action.Query`.
+
+**The namespace is the visibility rule.** When a subject other than the Candidate is snapshot, only its `State.*` tags are copied, through one filter container. `Intent.*` and `Cooldown.*` never leave their owner, so tags need no per-tag flags. Numbers stay private for the same reason. If others should perceive one, expose it as a banded State tag: the Health attribute stays private, and `State.Health.Wounded` is visible.
+
+### Where each kind of data lives
+
+| Kind | Example | Home | Why there |
+|---|---|---|---|
+| Current state | Moving, engaged | `State.*` owned tags | Ability gating, `showdebug abilitysystem`, ASC replication |
+| Quantities | Engaged count, morale, alarm, suppression | Attributes, changed by GEs | Stacking, aggregation, durations, change delegates |
+| Timed state | Engaged for 5 s | A duration GE that grants a `State.*` tag and modifies an attribute | Expires on its own, with no time math in conditions |
+| When something happened | Last shot at, last saw an enemy | History entries `{Event tag, time}` | GAS has no "how long ago" |
+| What I'm trying to do | Cover from the Instigator, currently moving | Intent history entries `{intent, reference, phase, time, outcome}` | Keeps intent, reference and phase paired, even with several intents in history |
+| What I believe about others | Enemy last seen at X, 4 s ago | Observation chunks on the observer | Knowledge belongs to the observer |
+| Places and references | Cover point, last known position | Subjects (see below) | Conditions address a place the same way as an actor |
+| Don't repeat | No re-flank for 10 s | A cooldown GE, plus the behavior's blocked tags | A pre-filter that needs no condition |
+| Cosmetic reaction | "Moving to cover!" voice line, hand signal | GameplayCue | Replicates to clients for free |
+
+Attributes reach conditions through `FAttributeChunk`, which `InitializeDataForOwner` already binds to the ASC. They're copied at snapshot like any other chunk. EngagedCombatants, Morale and LevelOfAlarm become attribute chunks that read an `AttributeSet`.
+
+AI decisions run on the host, so loose tags don't need to replicate for the Purpose system. State tags that clients need, for animation or UI, use the replicated loose-tag calls or come from GEs.
+
+### Subjects for places and beliefs
+
+Today anything that isn't an actor goes into Context as a chunk. Instead, let references be subjects. Then conditions such as RelativePosition or distance work the same whether the reference is an actor or a place, and a behavior can be designed around an intent plus a reference.
+
+- **`ESubject::Reference`:** what the current intent is relative to. The behavior fills it when selected, with one of:
+  - an actor (the Instigator),
+  - a place (the Instigator's last known position),
+  - an announcement's reference.
+- **Virtual subjects:** a place has no UObject. The worker already reads `TMap<ESubject, FDataMap> subjectSnapshots`, so a virtual subject only needs a DataMap (Location, optionally ViewPoint and time seen). Only the game-thread `FSubjectMap` needs a way to carry one, as a DataMap beside the weak object pointers.
+- **Beliefs over truth:** "last known position of EventTarget" is what the observer believes, not data the target holds. Store observations on the observer, keyed by whom they're about: last seen location and velocity, time seen, last announced intent.
+  - **First version:** snapshot other subjects' filtered truth (State tags and position). It's cheap and shared across candidates.
+  - **When stealth matters:** per-candidate belief subjects replace it, so the EventTarget a candidate scores against is what that candidate believes about it. The cost is that subject snapshots are no longer shared across an occurrence's candidates.
+
+An intent is authored once and varied by its reference: cover from the Instigator, from its last known position, or from what an ally announced.
+
+### The flow
+
+#### 1. Something happens: an occurrence
+
+Every occurrence carries an `Event.*` tag naming what happened. It can come from any of these:
+- **Ability activation**, as today.
+- **Gameplay effects.** Damage arrives as a GE, and its `FGameplayEffectContext` already holds:
+  - Instigator → `ESubject::Instigator`.
+  - EffectCauser and SourceObject → the weapon.
+  - HitResult → Context (hit location and direction).
+
+  Raise the occurrence from `OnGameplayEffectAppliedDelegateToSelf`, or from an attribute's `GetGameplayAttributeValueChangeDelegate` (Health dropped → `Event.Damage.Received`).
+- **Tag changes.** `RegisterGameplayTagEvent` on a State tag: an ally gains `State.Combat.UnderFire` → an occurrence for its squad.
+- **Perception.** `UAIPerceptionComponent::OnTargetPerceptionUpdated` → `Event.Perception.*`. This is the path for unannounced actions: an enemy who moves without a callout is still seen moving.
+- **Announcements.** A behavior's task sends `Event.Announce` carrying an intent and a reference ("moving to cover, there"), plus a GameplayCue for the voice line.
+  - Listeners get an occurrence with the announcer as Instigator and the announced place or actor as Reference.
+  - It is the only way intent becomes visible to others, and it carries only what the announcer chose to say. That could be wrong, or a bluff.
+- **World events:** destruction, keyed off the server-side event (see "World events as occurrences").
+
+This settles the perception broadcast question in "Open questions": both. An announcement is an occurrence, and so is perceiving something unannounced. Neither interrupts the receiver directly; scoring decides.
+
+#### 2. Who receives it
+
+- **Targeted:** EventTarget receives it directly (Performance #3).
+- **Broadcast:** candidates in range for that event tag. A table keyed by `Event.*` tag gives the radius and filters, for example:
+  - `Event.Weapon.Fired`: audible at long range, any faction.
+  - `Event.Announce`: short range, same faction.
+- **Perceived:** for sight-gated events, the candidate must perceive the instigator. This is the same game-thread snapshot step as SubjectVisibility: perception first, a trace as fallback.
+- **Recording on receipt:** the candidate adds a history entry `{Event tag, time}` and updates its observation of the instigator. This happens whether or not its behavior changes, which is the perception/decision separation above.
+
+#### 3. Snapshot (game thread)
+
+- **Candidate:** its DataMap (attributes resolve through `FAttributeChunk`), all owned tags (`GetOwnedGameplayTags()`) copied into a tags chunk, history, intent history and observations.
+- **Other subjects:** position, view point and `State.*` tags only. No intent.
+- **Context:** event tag, event location and direction, GE magnitude.
+- **Virtual subjects:** Reference, last known positions.
+- **Derived observations:** visibility between subjects, resolved now.
+
+#### 4. Evaluation (worker)
+
+1. **Trigger filter (new).** Each purpose declares which `Event.*` tags it reacts to, the way abilities declare `FAbilityTriggerData`. A damage occurrence never scores patrol purposes. This is the cheapest cut to the candidates × purposes × conditions cost.
+2. **Tag gate.** Check the behavior ability's activation required, blocked and cooldown tags against the snapshot's copied tag container. They're protected on `UGameplayAbility`, so `UBehavior_AI` exposes them. Don't call `CanActivateAbility` here: it isn't thread-safe, but comparing tags against a copied container is.
+3. **Score.** Conditions read tags (State, and the candidate's own intent history), attributes, history ages, observations and references.
+4. **Compare to current.** The new score must beat the current behavior's score.
+
+#### 5. Selection (game thread, `ProvidePurposeToOwner`)
+
+1. End the current behavior; step 7 runs for it with the outcome Interrupted.
+2. Set the new behavior and write its Reference subject.
+3. **Apply OnSelected before performing the ability.** Today OnSelected runs after the first task has already started, so that task can't see Context-targeted modifiers.
+4. Apply the OnSelected changes:
+   - **Numeric and timed changes become GameplayEffects** applied to the subject's ASC. For example, `GE_Engaged`: 5 s, one stack per combatant, grants `State.Combat.Engaged`, +1 to the Engaged attribute.
+   - **DataModifiers stay** for what GAS can't hold: history entries, references and observations.
+5. Write the intent history entry `{Intent.Cover, Reference, Seeking, now}`.
+6. Activate the behavior ability. Its asset tags include its `Intent.*` tag.
+
+#### 6. Reaction (the behavior runs)
+
+- **Tasks advance the phase.** `AT_RunEQSQuery` sets `State.Position.Seeking`; `AT_MoveTo` swaps it to `Moving`, then `AtLocation`.
+  - Each swap replaces the loose State tag and updates the phase on the intent entry. No string building.
+  - Loose tags must be removed when the ability ends, however it ends.
+- **Tasks set their `Action.*` tag** while running.
+- **An optional announce task** sends `Event.Announce` with a cue.
+- **Others react only to observable consequences.** Movement and firing raise occurrences for others through perception, not through reading this AI's data.
+
+#### 7. Finish
+
+- Remove the loose State tags. Duration GEs expire on their own.
+- Close the intent entry with an outcome. `EAbilityPurposeFeedback` already exists for this (succeeded, interrupted, failed). "Failed to reach cover 3 s ago" is something a condition can use.
+- Apply the purpose's cooldown GE, if it has one (`Cooldown.Intent.Flank`).
+- Raise `Event.Behavior.Finished` to self. This replaces the ad hoc occurrence in `SeekNewBehavior`.
+
+### Worked example
+
+A player shoots AI A. A's ally B is 20 m away. Enemy AI E is watching A from a distance.
+
+1. **The shot.** The player's fire ability applies `GE_Damage` to A. A's Health change raises `Event.Damage.Received` (Instigator = the player, Context = hit direction). The shot also raises `Event.Weapon.Fired`, an audible broadcast.
+2. **Receipt.** A receives the damage event. B hears the shot: it records `{Event.Weapon.Fired, t}` and an observation that the player was heard near X. E perceives nothing new yet.
+3. **A evaluates.** Two purposes trigger on `Event.Damage.Received`: "cover from Instigator" (`Intent.Cover`, Reference = Instigator) and "return fire". Their conditions read A's Suppression and Morale attributes, and whether A is already AtLocation in cover. Cover wins.
+4. **A selects.** `GE_UnderFire` applies (3 s, grants `State.Combat.UnderFire`, raises Suppression). A writes the intent entry `{Cover, player, Seeking}` and the behavior starts.
+5. **A announces.** A's announce task sends `Event.Announce {Intent.Cover, Reference = the player's position as A believes it}`, and a cue plays "Taking fire, moving to cover!". B receives it with Instigator = A and Reference = that position.
+6. **A moves.** A's EQS task sets Seeking; MoveTo sets Moving.
+7. **B reacts to the announcement.** "Suppress the announced reference" (`Intent.Suppress`, Reference = the announced position) triggers on `Event.Announce`. It scores on B's own conditions: Morale, a line of sight to the reference, B not already engaged. B never read A's intent; A told it.
+8. **E reacts to what it sees.** E sees A running, which raises `Event.Perception.Movement` with Instigator = A. E can read A's `State.Position.Moving` and current position, but not where A is going. "Push while they're moving" can score on that.
+
+### What stays Purpose-only
+
+- Scoring, selection, conditions and curves.
+- History ages ("how long ago").
+- Subjects, references and beliefs.
+- Snapshots and the evaluation threads.
+
+### Migration from the current tags
+
+- **`Contextual.Combat.Engaged.1–5`:**
+  - Replace with an Engaged attribute, `GE_Engaged` stacks and `State.Combat.Engaged`.
+  - Retire the string parsing in `FContextualHistoryModifier_Engaged`.
+  - Replace `UCondition_ContextualHistory_EngagedByCountForSubject` with an attribute-value condition.
+- **`Contextual.Position.<Kind>.<Phase>`** becomes `Intent.<Kind>` plus `State.Position.<Phase>`. The NearInstigator tag-string bug and the AT_MoveTo finished-tag bug go away with the code they're in.
+- **`Contextual.Position.Investigative.*`** becomes `Intent.Investigate` plus a Reference (the instigator, or the last known position). The search method stays on the EQS query asset.
+- **The root-level `Moving` and `Seeking` tags** become `State.Position.*`.
+- **EngagedCombatants, Morale and LevelOfAlarm** become attributes.
+
+### Open questions (this flow)
+
+- **Same intent, new reference** (cover from a second enemy): update the Reference in place, or restart the behavior?
+- **Truth vs. belief snapshots:** at what point to pay for per-candidate subjects.
+- **Event range and filter table:** a data table, or metadata on the tag itself?
+- **Observable tags:** which State tags are perceivable at range, and which only up close.
+
 ## Performance
 
 ### Purpose system fixes
@@ -296,6 +478,6 @@ Host migration snapshots must include alive AI and their Purpose state (current 
 ## Open questions
 
 - Where is the line between "ambient, can be regionally reconstructed" and "has stakes, must be arbitrated by a single authority"? Not yet defined.
-- Perception broadcast: dedicated announcement layer vs. a DataChunk update fed into existing scoring.
+- Perception broadcast: dedicated announcement layer vs. a DataChunk update fed into existing scoring. Direction proposed: both. Announcements and unannounced perception are each occurrences, and scoring decides. See "Design: occurrence to reaction with GAS (proposed)".
 - Baked-animation AI: at what distance to swap, and how to handle hit detection on distant AI.
 - What exactly needs serializing from the Purpose system for a host migration snapshot.

@@ -11,18 +11,15 @@ AAISpawner::AAISpawner()
 	// Set this actor to call Tick() every frame.  You can turn this off to improve performance if you don't need it.
 	PrimaryActorTick.bCanEverTick = false;
 
-	UActorRole* roleChunk = CreateDefaultSubobject<UActorRole>("UActorRole");
-	roleChunk->roles.Add(FRoleEntry(EActorRole::AI));
-	data.Add(FDataMapEntry(roleChunk));
-
-	UActorLocation& locationChunk = CreateDefaultSubobject<UActorLocation>("UActorLocation")->Initialize(this);
-	data.Add(FDataMapEntry(&locationChunk));
+	data.Set(FRoleChunk(EActorRole::AI));
+	data.Set(FActorLocationChunk());/// Binds to whoever receives the data (InitializeForOwner), so spawned AI report their own location
 }
 
 // Called when the game starts or when spawned
 void AAISpawner::BeginPlay()
 {
 	Super::BeginPlay();
+	data.InitializeForOwner(this, nullptr);/// The spawner's own location, until a spawned AI rebinds its copy to itself
 }
 
 void AAISpawner::InitializeTriggersForSpawn()
@@ -33,9 +30,9 @@ void AAISpawner::InitializeTriggersForSpawn()
 	{
 		trigger->SetFolderPath("SpawnZones");
 		FString displayName = "SpawnZone-" + trigger->GetClass()->GetName();
-		if (HasData(UActorRole::StaticClass()))
+		if (const FRoleChunk* roleChunk = DataChunk<FRoleChunk>(TAG_Data_Role))
 		{
-			displayName += "-" + DataChunk<UActorRole>()->ValueAsString();
+			displayName += "-" + roleChunk->ValueAsString();
 		}
 		trigger->Rename(*displayName);
 		trigger->SetActorLabel(*displayName);
@@ -57,20 +54,4 @@ void AAISpawner::InitializeTriggersForSpawn()
 	
 #endif
 }
-
-void AAISpawner::AddData_Implementation(UDataChunk* inData, bool overwriteValue)
-{
-	AddDataLocal(*inData, overwriteValue);
-}
-
-void AAISpawner::AppendData_Implementation(const TArray<FDataMapEntry>& inDataMap, bool overwriteValue)
-{
-	AppendDataLocal(inDataMap, overwriteValue);
-}
-
-void AAISpawner::RemoveData_Implementation(TSubclassOf<UDataChunk> inClass)
-{
-	RemoveDataLocal(inClass);
-}
-
 

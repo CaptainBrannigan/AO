@@ -46,6 +46,9 @@ protected:
 	FContextData currentBehaviorForOwner;
 
 	/// A storage of activated abilities to prevent occurrences every tick for individual ability activations
+	///Design: GAS Cooldowns Occurrences; This is a per-ability cooldown on raising occurrences
+	/// A GameplayEffect cooldown can't gate it directly (it gates activation, not the occurrence), but a tag granted for occurenceTimerMin by an
+	/// instant-applied duration effect (Cooldown.Occurrence.<ability tag>) would make it visible in GAS debugging and tunable per ability
 	TMap<TSubclassOf<class UGameplayAbility>, FDateTime> activatedAbilityTimeCache;
 
 	/// Limits how often an occurrence from a single ability can trigger
@@ -54,27 +57,32 @@ protected:
 #pragma region Datamap Interface
 public:
 
-	const TArray<FDataMapEntry>& DataMap() final { return data; }
-	TArray<FDataMapEntry> DataMapCopy() final { return data; }
+	const FDataMap& DataMap() const final { return data; }
 
-	UFUNCTION(Server, Reliable)
-	void AddData(UDataChunk* inData, bool overwriteValue = true) final;
+	/// Marks data dirty for push model replication (Iris and generic replication both use it)
+	void OnDataMapChanged() final;
 
-	UFUNCTION(Server, Reliable)
-	void AppendData(const TArray<FDataMapEntry>& inDataMap, bool overwriteValue = true) final;
-
-	UFUNCTION(Server, Reliable)
-	void RemoveData(TSubclassOf<UDataChunk> inClass) final;
+	/// Binds actor/attribute chunks to this component's avatar and ASC (see FDataChunk::InitializeForOwner)
+	/// Call after the avatar is set, and after any data is appended from a spawner
+	void InitializeDataForOwner();
 
 private:
 
-	UPROPERTY(Replicated)
+	UPROPERTY(Replicated, EditAnywhere, Category = "Data")
 	///This data is representative of the subject "ESubject::Candidate"
-	TArray<FDataMapEntry> data;
+	///Design: Network Replication FastArray; The whole array is compared and sent when any chunk changes
+	/// If per-AI data changes often, FDataMap can become an FFastArraySerializer (FDataMapEntry : FFastArraySerializerItem) so only changed entries are sent
+	/// Lyra's FGameplayTagStackContainer (LyraGame/System/GameplayTagStack.h) is the pattern
+	/* TODO: Data Defaults DataAsset Characters; Default chunks are authored per component/spawner instance, so subjects miss chunks conditions expect (Data.ViewPoint, Data.Actor)
+	Make a UPrimaryDataAsset (UCharacterDataDefaults) holding an FDataMap of default chunks plus an optional parent asset, with a shared base and AI/Player children
+	Base: Location, ViewPoint, Actor, Velocity, ContextualHistory. AI: Role AI, Morale, LevelOfAlarm. Player: Role Player
+	The component takes the asset and AppendMissing's it (parent first) before InitializeDataForOwner, so per-instance chunks still override
+	AISpawn's FAISpawnParameters could reference one too, replacing the location chunk it sets in its constructor */
+	FDataMap data;
 
 	/// Force implementers to provide an editable datamap
-	/// The only way to the change the DataMap is through the Server RPCs or server side calls
-	TArray<FDataMapEntry>& DataMapInternal() final { return data; }
+	/// Only reachable through IDataMapInterface, so every change marks data dirty
+	FDataMap& MutableDataMap() final { return data; }
 
 #pragma endregion
 
@@ -84,6 +92,9 @@ public:
 	void PerformAbility(FContextData& inContext, TSubclassOf<UGA_PurposeBase> abilityClass);
 
 	/// @param ability: Existing Ability will be duplicated and performed, bypassing the need for custom initializations and allowing ability specific properties editable in editor
+	///Design: GAS AbilitySpec SourceObject; Duplicating the inline ability template is what gives per-purpose ability settings
+	/// GAS's intended route is a class + FGameplayAbilitySpec::SourceObject (the purpose asset) or SetByCaller/GameplayEventData for per-use parameters,
+	/// which keeps instancing standard and avoids GiveAbilityDuplicate reaching into ActivatableAbilities (and the unexported AddReplicatedInstancedAbility)
 	void PerformAbility(FContextData& inContext, const TObjectPtr<UGA_PurposeBase> ability, uint8 priority);
 
 	/// @param ability: Ability as a non-null reference, as these abilitys have already been initialized prior to being sent to abilitysmanager
@@ -162,6 +173,9 @@ protected:
 
 	/** Notify called after GameplayTask changes state to Active (initial activation or resuming) */
 	void OnGameplayTaskActivated(UGameplayTask& Task) override;
+
+	/** Binds data chunks to the new avatar (InitializeDataForOwner) */
+	void InitAbilityActorInfo(AActor* InOwnerActor, AActor* InAvatarActor) override;
 
 #pragma endregion
 

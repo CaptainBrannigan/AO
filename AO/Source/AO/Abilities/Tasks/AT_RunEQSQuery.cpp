@@ -16,7 +16,7 @@ UAT_RunEQSQuery::UAT_RunEQSQuery(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
 {
 
-	AddData(CreateDefaultSubobject<UResult>("Result"));
+	dataMap.Set(FActorVectorChunk(TAG_Data_Task_EQS_Result));
 	NotificationDelegate = FQueryFinishedSignature::CreateUObject(this, &UAT_RunEQSQuery::ResultFound);
 	contextualTagForTask.AddTag(TAG_Seeking);
 }
@@ -74,9 +74,8 @@ bool UAT_RunEQSQuery::PreActivationInitialization(const FActionSequenceEntry& en
 	
 
 	/// Check to see if we have a tag that indicates a found position, and modify that tag to indicate we are moving to that position
-	if (source.Vessel() && source.Vessel()->HasData(UContextualHistory::StaticClass()))
+	if (FContextualHistoryChunk* contextualTagData = source.Vessel() ? source.Vessel()->EditData<FContextualHistoryChunk>(TAG_Data_ContextualHistory) : nullptr)
 	{
-		TObjectPtr<UContextualHistory> contextualTagData = source.Vessel()->DataChunk<UContextualHistory>();
 
 		for (int i = 0; i < query->contextualTagsForQuery.Num(); ++i)
 		{
@@ -177,11 +176,11 @@ void UAT_RunEQSQuery::ResultFound(TSharedPtr<FEnvQueryResult> Result)
 
 	if (chosenActor)
 	{
-		DataChunk<UResult>()->SetValueWithActor(chosenActor);
+		if (FActorVectorChunk* result = EditData<FActorVectorChunk>(TAG_Data_Task_EQS_Result)) { result->SetValueWithActor(chosenActor); }
 	}
 	else if (chosenLocation != FVector::ZeroVector)
 	{
-		DataChunk<UResult>()->SetValue(chosenLocation);
+		if (FActorVectorChunk* result = EditData<FActorVectorChunk>(TAG_Data_Task_EQS_Result)) { result->SetValue(chosenLocation); }
 	}
 	else
 	{

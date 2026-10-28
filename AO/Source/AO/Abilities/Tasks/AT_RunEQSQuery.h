@@ -6,12 +6,12 @@
 #include "Abilities/SequenceTaskInterface.h"
 #include "DataChunks/ActorVector.h"
 #include "DataChunks/ActorReference.h"
+#include "Data/DataTags.h"
 #include "DataAssets/QueryContextAsset.h"
 #include "AT_RunEQSQuery.generated.h"
 
-UCLASS(MinimalAPI)
-/// Used to store the result or result's location
-class UResult : public UActorVector { GENERATED_BODY() };
+/// Task data (Data/DataTags.h), previously UResult
+/// Data.Task.EQS.Result	FActorVectorChunk, the chosen actor or location
 
 UCLASS(BlueprintType, Blueprintable, EditInlineNew)
 class UAT_RunEQSQuery : public UAITask_RunEQS, public IDataMapInterface, public ISequenceTaskInterface
@@ -61,17 +61,12 @@ protected:
 	FSequenceTaskFinished taskFinished;
 
 	///Allows evaluations to retrieve chunks of data from any type of object implementing interface
-	const TArray<FDataMapEntry>& DataMap() final { return dataMap; }
-	TArray<FDataMapEntry> DataMapCopy() final { return dataMap; }
+	const FDataMap& DataMap() const final { return dataMap; }
 
-	void AddData(UDataChunk* inData, bool overwriteValue = true) final { AddDataLocal(*inData); }
-	void AppendData(const TArray<FDataMapEntry>& inDataMap, bool overwriteValue = true) final { AppendDataLocal(inDataMap); }
-	void RemoveData(TSubclassOf<UDataChunk> inClass) final { RemoveDataLocal(inClass); }
 
 	UPROPERTY(EditAnywhere)
-		TArray<FDataMapEntry> dataMap;
+		FDataMap dataMap;
 
 	/// Force implementers to provide an editable datamap
-	/// The only way to the change the DataMap is through the Server RPCs
-	TArray<FDataMapEntry>& DataMapInternal() final { return dataMap; }
+	FDataMap& MutableDataMap() final { return dataMap; }
 };

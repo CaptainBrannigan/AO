@@ -13,11 +13,39 @@
 
 AO_API DECLARE_LOG_CATEGORY_EXTERN(LogCondition, Log, All);
 
-UCLASS(Abstract, BlueprintType, Blueprintable, EditInlineNew, ClassGroup = "Conditions", DefaultToInstanced)
+/// <summary>
+/// What conditions read: one snapshot DataMap per subject (Context included, as an ordinary subject)
+/// The maps are owned by the FOccurrence being evaluated, this only points at them, so building one per candidate is free
+/// Everything reachable from here is a value copy, which is what makes condition evaluation safe on the evaluation thread
+/// </summary>
+struct AO_API FSubjectDataView
+{
+	const FDataMap* Find(ESubject inSubject) const { return maps[static_cast<uint8>(inSubject)]; }
+	void Set(ESubject inSubject, const FDataMap* inMap) { maps[static_cast<uint8>(inSubject)] = inMap; }
+
+	template<typename T = FDataChunk>
+	const T* FindChunk(ESubject inSubject, FGameplayTag inKey) const
+	{
+		const FDataMap* map = Find(inSubject);
+		return map ? map->Find<T>(inKey) : nullptr;
+	}
+
+private:
+	const FDataMap* maps[static_cast<uint8>(ESubject::MAX)] = {};
+};
+
+UCLASS(Abstract, BlueprintType, Blueprintable, EditInlineNew, ClassGroup = "Conditions", DefaultToInstanced, CollapseCategories)
 /// <summary>
 ///UConditions, using DataChunks, establish a criteria which ContextDatas will be evaluated against
 ///in order to determine the most suitable purpose for that context
+///
+/// Conditions are evaluated on the purpose evaluation thread, so scoring is a C++ virtual (Evaluate) that only reads the FSubjectDataView
+/// Blueprint subclasses are fine for CONFIGURATION (preset keys, weights, curves), but can't override scoring:
+/// Blueprint code assumes the game thread, and the previous BlueprintNativeEvent ran it on the evaluation thread
 /// </summary>
+///Design: Conditions Blueprint Iteration; If BP-authored scoring is wanted for iteration, add a UCondition_Blueprint whose BlueprintImplementableEvent
+/// is evaluated on the game thread (the occurrence is queued back to the game thread for that condition, then returns to the worker)
+/// It would be slower, so it's meant for prototyping a condition before writing it in C++
 class AO_API UCondition : public UObject
 {
 	GENERATED_BODY()
@@ -28,13 +56,8 @@ public:
 	UCondition();
 
 	UPROPERTY(EditAnywhere, Category = "Condition", DisplayName = "Condition Description", meta = (DisplayPriority = "1"))
-	///Helper text for understanding a condition	
+	///Helper text for understanding a condition
 	FText description;
-
-	///Place this within lowest derived Condition (DataVsData), so that conditionals specific to that condition can exist
-	//UPROPERTY(EditAnywhere, Category = "Condition", meta = (DisplayPriority = "4"))
-	/////An Enum representing how the user wishes the two data types to be compared
-	//EConditional conditional;
 
 	UPROPERTY(EditAnywhere, Category = "Condition", meta = (DisplayPriority = "8", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.0", UIMax = "2.0"))
 	///Determines the magnitude of the condition
@@ -48,10 +71,22 @@ public:
 	///The primary subject to seek for comparison
 	ESubject primarySubjectType = ESubject::None;
 
+	UPROPERTY(EditAnywhere, Category = "Condition", DisplayName = "Primary Data", meta = (DisplayPriority = "3", Categories = "Data"))
+	///The key of the chunk to be evaluated on the primary subject (replaces PrimaryData())
+	///The chunk type is decided by the condition class: a float condition only finds float chunks under this key
+	///If it is not found then the score will be 0
+	FGameplayTag primaryKey;
+
 	UPROPERTY(EditAnywhere, Category = "Condition", DisplayName = "Subject To Compare Against", meta = (DisplayPriority = "6", EditCondition="bHasSecondSubject == true", EditConditionHides))
 	///If desired, a subject to compare data against the primary subject
 	///Leave as NONE to compare the primary subject data against a specified value
 	ESubject secondarySubjectType = ESubject::None;
+
+	UPROPERTY(EditAnywhere, Category = "Condition", DisplayName = "Secondary Data", meta = (DisplayPriority = "7", Categories = "Data", EditCondition = "bHasSecondSubject == true", EditConditionHides))
+	///The key of the chunk to compare against (replaces SecondaryData())
+	///With a secondary subject: leave empty to read the primary key from the secondary subject
+	///Without a secondary subject: read from the primary subject, or leave empty to compare against a value on the condition
+	FGameplayTag secondaryKey;
 
 	UPROPERTY(EditAnywhere, Category = "Condition Data", DisplayName = "Max", meta = (DisplayPriority = "15", EditCondition = bHasRange, EditConditionHides))
 	///Establishes a max of a bookend for which values are normalized within
@@ -96,372 +131,32 @@ public:
 	///Normalizes a score "x" between the "min-max" bookends of the condition
 	float Normalize(float x) const { return FMath::Clamp((FMath::Abs(x) - FMath::Abs(min)) / (FMath::Abs(max) - FMath::Abs(min)), 0.f, 1.f); }
 
-		///Retrieve data specified for the condition from context
+	///Retrieve data specified for the condition from the subjects' snapshots
 	///Translate retrieved data into a score
-	/// @param context: The aray of subjects and the data maps associated to them
-	/// @param owner: The IPurposeManagementInterface owner of the context can allow access to other aspects of the PurposeSystem when evaluating
-	float InitiateEvaluation(const TMap<ESubject, TArray<FDataMapEntry>>& context, TWeakObjectPtr<class UPurposeAbilityComponent> owner) const
+	/// Safe on the evaluation thread: reads only the view and this condition's own properties
+	/// @param data: The snapshot DataMap of every subject of the occurrence, Context and Candidate included
+	float InitiateEvaluation(const FSubjectDataView& data) const
 	{
-		TObjectPtr<UDataChunk> primary = nullptr;
-		TObjectPtr<UDataChunk> secondary = nullptr;
-
-		///retrieve the relevant data chunks
-		if (RetrieveConditionDataChunks(context, primary, secondary))
+		if (primarySubjectType == ESubject::None || !primaryKey.IsValid())
 		{
-			return EvaluateConditionInternal(primary, secondary, owner.Get());
-		}
-
-		return 0.0f;
-	}
-
-	UFUNCTION(BlueprintNativeEvent)
-		float EvaluateConditionInternal(const UDataChunk* primaryDataChunk, const UDataChunk* secondaryDataChunk, class UPurposeAbilityComponent* owner) const;
-		virtual float EvaluateConditionInternal_Implementation(const UDataChunk* primaryDataChunk, const UDataChunk* secondaryDataChunk, class UPurposeAbilityComponent* owner) const;
-
-	UFUNCTION(BlueprintNativeEvent)
-	TSubclassOf<UDataChunk> PrimaryData() const;
-	///The primary data is the constant data type to be evaluated for the condition
-	///If it is not found then the score will be 0
-	///It can either be compared against a second data type or a value specified on the UCondition
-	///Override this method with a covarient return type to represent the data specific to the condition
-	FORCEINLINE virtual TSubclassOf<UDataChunk> PrimaryData_Implementation() const PURE_VIRTUAL(UCondition::PrimaryData, return nullptr;)
-
-	UFUNCTION(BlueprintNativeEvent)
-	TSubclassOf<UDataChunk> SecondaryData() const;
-	///The secondary data is a data type which the primary data type will be compared against
-	///A value can not be specified for secondary data, the value is retrieved from a subject
-	///Override this method with a covarient return type to represent the data specific to the condition
-	FORCEINLINE virtual TSubclassOf<UDataChunk> SecondaryData_Implementation() const PURE_VIRTUAL(UCondition::SecondaryData, return nullptr;)
-
-	template<class PrimaryType, class SecondaryType>///Templated so that casting is not required on retrieved primary and secondary
-	///Retrieve the DataChunks from the ContextData via primary and secondary UDataChunk types
-	///@param primary: An out parameter which will hold the primary data type, the type of which is specified in derived UConditions
-	///@param secondary: An out parameter which will hold the secondary data type, the type of which is specified in derived UConditions
-	///@return bool == false if a the primary subject or data of the context can not be found
-	bool RetrieveConditionDataChunks(const TMap<ESubject, TArray<FDataMapEntry>>& context, TObjectPtr<PrimaryType>& primary, TObjectPtr<SecondaryType>& secondary, ESubject secondarySubject) const
-	{
-		////Global::Log(FULLTRACE, PurposeLog, "Condition", "RetrieveConditionDataChunk", TEXT("1"));
-		if (primarySubjectType == ESubject::None || !PrimaryData())
-		{
-			Global::LogError(PURPOSE, GetName(), "RetrieveConditionDataChunks", TEXT("Data not retrieved for Description: %s. Primary Subject: %s, PrimaryData of Condition: %s.")
+			Global::LogError(LogCondition, GetName(), "InitiateEvaluation", TEXT("Data not retrieved for Description: %s. Primary Subject: %s, Primary Key: %s.")
 				, *description.ToString()
 				, *Global::EnumValueOnly<ESubject>(primarySubjectType)
-				, IsValid(PrimaryData()) ? *PrimaryData()->GetName() : TEXT("Invalid")
+				, *primaryKey.ToString()
 			);
-			return false;///No further logic is necessary, just return false so the score of the condition will be 0
+			return 0.0f;///No further logic is necessary, just return 0 so the score of the condition will be 0
 		}
 
-		if (!context.Contains(primarySubjectType))
-		{
-			Global::LogError(PURPOSE, GetName(), "RetrieveConditionDataChunks", TEXT("PrimarySubject not retrieved for Description: %s. Primary Subject: %s, PrimaryData of Condition: %s.")
-				, *description.ToString()
-				, *Global::EnumValueOnly<ESubject>(primarySubjectType)
-				, IsValid(PrimaryData()) ? *PrimaryData()->GetName() : TEXT("Invalid")
-			);
-			return false;///No further logic is necessary, just return false so the score of the condition will be 0
-		}
-
-		if (!context[primarySubjectType].Contains(PrimaryData()))
-		{
-			Global::LogError(PURPOSE, GetName(), "RetrieveConditionDataChunks", TEXT("PrimaryData not retrieved for Description: %s. Primary Subject: %s, PrimaryData of Condition: %s.")
-				, *description.ToString()
-				, *Global::EnumValueOnly<ESubject>(primarySubjectType)
-				, IsValid(PrimaryData()) ? *PrimaryData()->GetName() : TEXT("Invalid")
-			);
-			return false;///No further logic is necessary, just return false so the score of the condition will be 0
-		}
-
-		primary = Cast<PrimaryType>(context[primarySubjectType].FindByKey(PrimaryData())->Chunk);///Find the primary DataChunk to be evaluated
-
-		if (!primary)
-		{
-			/*Global::LogError(PURPOSE, GetName(), "RetrieveConditionDataChunks", TEXT("Primary from Context nullptr. Description: %s. Subject Type: %s, Subject: %s, Type: %s, Was Found? %s. Cast To %s %s.")
-				, *description.ToString()
-				, *Global::EnumValueOnly<ESubject>(primarySubjectType)
-				,  IsValid(context->Subject(primarySubjectType)) ? *context->Subject(primarySubjectType)->GetName() : TEXT("Unknown")
-				, *PrimaryData()->GetName()
-				, IsValid(context->DataChunk(primarySubjectType, PrimaryData())) ? TEXT("True") : TEXT("False")
-				, *PrimaryType::StaticClass()->GetName()
-				, Cast<PrimaryType>(context->DataChunk(primarySubjectType, PrimaryData())) ? TEXT("success") : TEXT("failed")
-			);*/
-			return false;
-		}
-
-		if (secondarySubject != ESubject::None)///Then retrieve comparison data from Secondary Subject
-		{
-			if (!context.Contains(secondarySubject))
-			{
-				Global::LogError(PURPOSE, GetName(), "RetrieveConditionDataChunks", TEXT("SecondarySubject not retrieved for Description: %s. Secondary Subject: %s.")
-					, *description.ToString()
-					, *Global::EnumValueOnly<ESubject>(secondarySubject)
-				);
-				return false;///No further logic is necessary, just return false so the score of the condition will be 0
-			}
-
-			if (SecondaryData())///Then comparison data is the Secondary Data-Type from the Secondary Subject
-			{
-
-				if (!context[secondarySubject].Contains(SecondaryData()))
-				{
-					Global::LogError(PURPOSE, GetName(), "RetrieveConditionDataChunks", TEXT("PrimaryData not retrieved for Description: %s. Primary Subject: %s, PrimaryData of Condition: %s.")
-						, *description.ToString()
-						, *Global::EnumValueOnly<ESubject>(primarySubjectType)
-						, IsValid(PrimaryData()) ? *PrimaryData()->GetName() : TEXT("Invalid")
-					);
-					return false;///No further logic is necessary, just return false so the score of the condition will be 0
-				}
-
-				secondary = Cast<SecondaryType>(context[secondarySubject].FindByKey(SecondaryData())->Chunk);/// Find the secondary data of secondary type from secondary subject
-				////Global::Log(Debug, PURPOSE, GetName(), "RetrieveConditionDataChunks", TEXT("Second Subject %s + DataClassName: %s"), *UEnum::GetValueAsString(secondarySubject), IsValid(SecondaryData()) ? *SecondaryData()->GetName() : TEXT("GetClass() = nullptr"));
-			}
-			else///Then comparison data is Primary Data-Type from Secondary Subject
-			{
-				if (!context[secondarySubject].Contains(PrimaryData()))
-				{
-					Global::LogError(PURPOSE, GetName(), "RetrieveConditionDataChunks", TEXT("PrimaryData not retrieved for Description: %s. Primary Subject: %s, PrimaryData of Condition: %s.")
-						, *description.ToString()
-						, *Global::EnumValueOnly<ESubject>(primarySubjectType)
-						, IsValid(PrimaryData()) ? *PrimaryData()->GetName() : TEXT("Invalid")
-					);
-					return false;///No further logic is necessary, just return false so the score of the condition will be 0
-				}
-
-				secondary = Cast<SecondaryType>(context[secondarySubject].FindByKey(PrimaryData())->Chunk);/// Find the secondary data of primary type from secondary subject
-				////Global::Log(Debug, PURPOSE, GetName(), "RetrieveConditionDataChunks", TEXT("Second Subject %s +  Primary DataClassName: %s"), *UEnum::GetValueAsString(secondarySubject), IsValid(PrimaryData()) ? *PrimaryData()->GetName() : TEXT("GetClass() = nullptr"));
-			}
-		}
-		else///Then retrieve comparison data from Primary Subject
-		{
-			if (SecondaryData())//Then comparison data is the secondary Data-Type from the Primary Subject
-			{
-				////Global::Log(Debug, PURPOSE, GetName(), "RetrieveConditionDataChunks", TEXT("Primary Subject %s +  Secondary DataClassName: %s"), *UEnum::GetValueAsString(primarySubjectType.subject), IsValid(SecondaryData()) ? *SecondaryData()->GetName() : TEXT("GetClass() = nullptr"));
-				secondary = Cast<SecondaryType>(context[primarySubjectType].FindByKey(SecondaryData())->Chunk);
-			}
-			else///Then comparison data is the value indicated in the condition and nothing need be done
-			{
-				////Global::Log(Debug, PURPOSE, GetName(), "RetrieveConditionDataChunks", TEXT("Primary Subject %s +  Primary DataClassName: %s"), *UEnum::GetValueAsString(primarySubjectType.subject), IsValid(PrimaryData()) ? *PrimaryData()->GetName() : TEXT("GetClass() = nullptr"));
-			}
-		}
-
-		///Refactor: Conditions Purpose; Can we make it so that this can return false without primary and secondary?
-			/// The issue is that from here, we don't know what the any optional values are, as they are specified in derived classes
-			/// Without that knowledge, we can't say "if secondary is invalid, use the optional value". That has to be done in the derived class
-		//return IsValid(primary) && IsValid(secondary);
-
-		return true;
-	}	
-		
-	///Retrieve the DataChunks from the ContextData via primary and secondary UDataChunk types
-	///@param primary: An out parameter which will hold the primary data, the type of which is specified in derived UConditions
-	///@param secondary: An out parameter which will hold the secondary data, the type of which is specified in derived UConditions
-	///@return bool == false if a the primary subject or data of the context can not be found
-	bool RetrieveConditionDataChunks(const TMap<ESubject, TArray<FDataMapEntry>>& context, TObjectPtr<UDataChunk>& primary, TObjectPtr<UDataChunk>& secondary) const
-	{
-		////Global::Log(FULLTRACE, PurposeLog, "Condition", "RetrieveConditionDataChunk", TEXT("1"));
-		if (primarySubjectType == ESubject::None || !PrimaryData())
-		{
-			Global::LogError(PURPOSE, GetName(), "RetrieveConditionDataChunks", TEXT("Data not retrieved for Description: %s. Primary Subject: %s, PrimaryData of Condition: %s.")
-				, *description.ToString()
-				, *Global::EnumValueOnly<ESubject>(primarySubjectType)
-				, IsValid(PrimaryData()) ? *PrimaryData()->GetName() : TEXT("Invalid")
-			);
-			return false;///No further logic is necessary, just return false so the score of the condition will be 0
-		}
-
-		if (!context.Contains(primarySubjectType))
-		{
-			Global::Log(DATADEBUG, PURPOSE, GetName(), "RetrieveConditionDataChunks", TEXT("PrimarySubject not retrieved for Description: %s. Primary Subject: %s, PrimaryData of Condition: %s.")
-				, *description.ToString()
-				, *Global::EnumValueOnly<ESubject>(primarySubjectType)
-				, IsValid(PrimaryData()) ? *PrimaryData()->GetName() : TEXT("Invalid")
-			);
-			return false;///No further logic is necessary, just return false so the score of the condition will be 0
-		}
-
-		if (!context[primarySubjectType].Contains(PrimaryData()))
-		{
-			Global::Log(DATADEBUG, PURPOSE, GetName(), "RetrieveConditionDataChunks", TEXT("PrimaryData not retrieved for Description: %s. Primary Subject: %s, PrimaryData of Condition: %s.")
-				, *description.ToString()
-				, *Global::EnumValueOnly<ESubject>(primarySubjectType)
-				, IsValid(PrimaryData()) ? *PrimaryData()->GetName() : TEXT("Invalid")
-			);
-			return false;///No further logic is necessary, just return false so the score of the condition will be 0
-		}
-
-		primary = context[primarySubjectType].FindByKey(PrimaryData())->Chunk;///Find the primary DataChunk to be evaluated
-
-		if (!primary)
-		{
-			/*Global::LogError(PURPOSE, GetName(), "RetrieveConditionDataChunks", TEXT("Primary from Context nullptr. Description: %s. Subject Type: %s, Subject: %s, Type: %s, Was Found? %s. Cast To %s %s.")
-				, *description.ToString()
-				, *Global::EnumValueOnly<ESubject>(primarySubjectType)
-				,  IsValid(context->Subject(primarySubjectType)) ? *context->Subject(primarySubjectType)->GetName() : TEXT("Unknown")
-				, *PrimaryData()->GetName()
-				, IsValid(context->DataChunk(primarySubjectType, PrimaryData())) ? TEXT("True") : TEXT("False")
-				, *PrimaryType::StaticClass()->GetName()
-				, Cast<PrimaryType>(context->DataChunk(primarySubjectType, PrimaryData())) ? TEXT("success") : TEXT("failed")
-			);*/
-			return false;
-		}
-
-		if (secondarySubjectType != ESubject::None)///Then retrieve comparison data from Secondary Subject
-		{
-			if (!context.Contains(secondarySubjectType))
-			{
-				Global::Log(DATADEBUG, PURPOSE, GetName(), "RetrieveConditionDataChunks", TEXT("SecondarySubject not retrieved for Description: %s. Secondary Subject: %s.")
-					, *description.ToString()
-					, *Global::EnumValueOnly<ESubject>(secondarySubjectType)
-				);
-				return false;///No further logic is necessary, just return false so the score of the condition will be 0
-			}
-
-			if (SecondaryData())///Then comparison data is the Secondary Data-Type from the Secondary Subject
-			{
-
-				if (!context[secondarySubjectType].Contains(SecondaryData()))
-				{
-					Global::Log(DATADEBUG, PURPOSE, GetName(), "RetrieveConditionDataChunks", TEXT("PrimaryData not retrieved for Description: %s. Primary Subject: %s, PrimaryData of Condition: %s.")
-						, *description.ToString()
-						, *Global::EnumValueOnly<ESubject>(primarySubjectType)
-						, IsValid(PrimaryData()) ? *PrimaryData()->GetName() : TEXT("Invalid")
-					);
-					return false;///No further logic is necessary, just return false so the score of the condition will be 0
-				}
-
-				secondary = context[secondarySubjectType].FindByKey(SecondaryData())->Chunk;/// Find the secondary data of secondary type from secondary subject
-				////Global::Log(Debug, PURPOSE, GetName(), "RetrieveConditionDataChunks", TEXT("Second Subject %s + DataClassName: %s"), *UEnum::GetValueAsString(secondarySubjectType), IsValid(SecondaryData()) ? *SecondaryData()->GetName() : TEXT("GetClass() = nullptr"));
-			}
-			else///Then comparison data is Primary Data-Type from Secondary Subject
-			{
-				if (!context[secondarySubjectType].Contains(PrimaryData()))
-				{
-					Global::Log(DATADEBUG, PURPOSE, GetName(), "RetrieveConditionDataChunks", TEXT("PrimaryData not retrieved for Description: %s. Primary Subject: %s, PrimaryData of Condition: %s.")
-						, *description.ToString()
-						, *Global::EnumValueOnly<ESubject>(primarySubjectType)
-						, IsValid(PrimaryData()) ? *PrimaryData()->GetName() : TEXT("Invalid")
-					);
-					return false;///No further logic is necessary, just return false so the score of the condition will be 0
-				}
-
-				secondary = context[secondarySubjectType].FindByKey(PrimaryData())->Chunk;/// Find the secondary data of primary type from secondary subject
-				////Global::Log(Debug, PURPOSE, GetName(), "RetrieveConditionDataChunks", TEXT("Second Subject %s +  Primary DataClassName: %s"), *UEnum::GetValueAsString(secondarySubjectType), IsValid(PrimaryData()) ? *PrimaryData()->GetName() : TEXT("GetClass() = nullptr"));
-			}
-		}
-		else///Then retrieve comparison data from Primary Subject
-		{
-			if (SecondaryData())//Then comparison data is the secondary Data-Type from the Primary Subject
-			{
-				////Global::Log(Debug, PURPOSE, GetName(), "RetrieveConditionDataChunks", TEXT("Primary Subject %s +  Secondary DataClassName: %s"), *UEnum::GetValueAsString(primarySubjectType.subject), IsValid(SecondaryData()) ? *SecondaryData()->GetName() : TEXT("GetClass() = nullptr"));
-				secondary = context[primarySubjectType].FindByKey(SecondaryData())->Chunk;
-			}
-			else///Then comparison data is the value indicated in the condition and nothing need be done
-			{
-				////Global::Log(Debug, PURPOSE, GetName(), "RetrieveConditionDataChunks", TEXT("Primary Subject %s +  Primary DataClassName: %s"), *UEnum::GetValueAsString(primarySubjectType.subject), IsValid(PrimaryData()) ? *PrimaryData()->GetName() : TEXT("GetClass() = nullptr"));
-			}
-		}
-
-		///Refactor: Conditions Purpose; Can we make it so that this can return false without primary and secondary?
-			/// The issue is that from here, we don't know what the any optional values are, as they are specified in derived classes
-			/// Without that knowledge, we can't say "if secondary is invalid, use the optional value". That has to be done in the derived class
-		//return IsValid(primary) && IsValid(secondary);
-
-		return true;
-	}	
-	
-	template<class PrimaryType>///Templated so that casting is not required on retrieved primary and secondary
-	///Retrieve the DataChunks from the ContextData via primary and secondary UDataChunk types
-	///@param primary: An out parameter which will hold the primary data type, the type of which is specified in derived UConditions
-	///@return bool == false if a the primary subject or data of the context can not be found
-	bool RetrieveConditionDataChunks(const TMap<ESubject, TArray<FDataMapEntry>>& context, TObjectPtr<PrimaryType>& primary) const
-	{
-		////Global::Log(FULLTRACE, PurposeLog, "Condition", "RetrieveConditionDataChunk", TEXT("1"));
-		if (primarySubjectType == ESubject::None || !PrimaryData())
-		{
-			Global::LogError(PURPOSE, GetName(), "RetrieveConditionDataChunks", TEXT("Description: %s. Primary Subject: %s, PrimaryData of Condition: %s.")
-				, *description.ToString()
-				, *Global::EnumValueOnly<ESubject>(primarySubjectType)
-				, IsValid(PrimaryData()) ? *PrimaryData()->GetName() : TEXT("Invalid")
-			);
-			return false;///No further logic is necessary, just return false so the score of the condition will be 0
-		}
-		////Global::Log(FULLTRACE, PurposeLog, "Condition", "RetrieveConditionDataChunk", TEXT("2"));
-
-
-		if (!context.Contains(primarySubjectType))
-		{
-			Global::LogError(PURPOSE, GetName(), "RetrieveConditionDataChunks", TEXT("PrimarySubject not retrieved for Description: %s. Primary Subject: %s, PrimaryData of Condition: %s.")
-				, *description.ToString()
-				, *Global::EnumValueOnly<ESubject>(primarySubjectType)
-				, IsValid(PrimaryData()) ? *PrimaryData()->GetName() : TEXT("Invalid")
-			);
-			return false;///No further logic is necessary, just return false so the score of the condition will be 0
-		}
-
-		if (!context[primarySubjectType].Contains(PrimaryData()))
-		{
-			Global::LogError(PURPOSE, GetName(), "RetrieveConditionDataChunks", TEXT("PrimaryData not retrieved for Description: %s. Primary Subject: %s, PrimaryData of Condition: %s.")
-				, *description.ToString()
-				, *Global::EnumValueOnly<ESubject>(primarySubjectType)
-				, IsValid(PrimaryData()) ? *PrimaryData()->GetName() : TEXT("Invalid")
-			);
-			return false;///No further logic is necessary, just return false so the score of the condition will be 0
-		}
-
-		primary = Cast<PrimaryType>(context[primarySubjectType].FindByKey(PrimaryData())->Chunk);///Find the primary DataChunk to be evaluated
-		////Global::Log(Debug, PurposeLog, GetName(), "RetrieveConditionDataChunks", TEXT("Primary Subject: %s, Data sought after: %s, Value found: %s"), 
-		//	/**UEnum::GetValueAsString(primarySubjectType)*/ *StaticEnum<ESubject>()->GetDisplayNameTextByValue((int64)primarySubjectType).ToString(), 
-		//	*PrimaryData()->GetName(), 
-		//	IsValid(primary) ? *primary->GetName() : TEXT("nullptr")
-		//);
-
-		if (!primary)
-		{
-			//Global::LogError(PURPOSE, GetName(), "RetrieveConditionDataChunks", TEXT("Primary from Context nullptr. Description: %s. Subject Type: %s, Subject: %s, Type: %s, Was Found? %s. Cast To %s %s.")
-			//	, *description.ToString()
-			//	,*Global::EnumValueOnly<ESubject>(primarySubjectType)
-			//	//, subjectCombination.subjects.Contains(ESubject::Candidate) ? *subjectCombination.subjects[ESubject::Candidate].GetObject()->GetOuter()->GetName() : TEXT("Invalid")
-			//	, *PrimaryData()->GetName()
-			//	, IsValid(context->DataChunk(primarySubjectType, PrimaryData())) ? TEXT("True") : TEXT("False")
-			//	, *PrimaryType::StaticClass()->GetName()
-			//	, Cast<PrimaryType>(context->DataChunk(primarySubjectType, PrimaryData())) ? TEXT("was a success") : TEXT("failed")
-			//);
-			return false;
-		}
-		////Global::Log(FULLTRACE, PurposeLog, "Condition", "RetrieveConditionDataChunk", TEXT("3"));
-
-		return true;
+		return Evaluate(data);
 	}
 
 	///Test: Condition Purpose PurposeEvaluation; ensure that user specified min-max values actually affect score correctly
 	///@return float = if a curve has been setup for condition, the inValue position on curve, else inValue
 	float AdjustToCurve(float inValue) const
 	{
-		/*if (userResponseCurve.GetNumKeys() > 0)
-		{
-			//Global::Log(FULLTRACE, PurposeLog, GetName(), "AdjustToCurve", TEXT("Response Curve has user defined Keys."));
-			if (max != min)
-			{
-				FRichCurve curveCopy = userResponseCurve;
-				curveCopy.ReadjustTimeRange(min, max, true, 0, 1);
-				return curveCopy.Eval(inValue);
-			}
-
-			return userResponseCurve.Eval(inValue);
-		}
-		else*/ if (IsValid(responseCurve.Get()))
+		if (IsValid(responseCurve.Get()))
 		{
 			Global::Log(CALLTRACETRIVIAL, PURPOSE, GetName(), "AdjustToCurve", TEXT("Response Curve is valid."));
-
-			//FRichCurve curveCopy = responseCurve->FloatCurve;
-			/*FIndexedCurve duplicateCurve = *responseCurve->FloatCurve.Duplicate();*/
-			/*FRichCurve* duplicateCurve = Cast<FRichCurve>(responseCurve->FloatCurve.Duplicate());
-
-			if (duplicateCurve)
-			{
-				duplicateCurve->ReadjustTimeRange(min, max, true, 0, 1);
-				return duplicateCurve->Eval(inValue);
-			}*/
-			//float scoreAlongCurve = curveCopy.Eval(inValue);
 
 			if ((bHasScoreFloor && inValue < min) || (bHasScoreCeiling && inValue > max))
 			{
@@ -477,7 +172,6 @@ public:
 		else/// if neither curves are present, then normalize the value between min and max, which will appear as a linear response curve
 		{
 			Global::Log(CALLTRACETRIVIAL, PURPOSE, description.ToString(), "AdjustToCurve", TEXT("No response curves."));
-			//return Normalize(inValue);
 
 			if ((bHasScoreFloor && inValue < min) || (bHasScoreCeiling && inValue > max))
 			{
@@ -488,43 +182,79 @@ public:
 			Global::Log(DATATRIVIAL, PURPOSE, description.ToString(), "AdjustToCurve", TEXT("Invalue = %f. Score normalized = %f."), inValue, normalizedScore);
 			return normalizedScore;
 		}
-
-		//return inValue;
 	}
 
-#pragma endregion
+protected:
 
-#pragma region DerivedConditions
-public:
+	/// Override in derived conditions to turn the retrieved chunks into a value, which AdjustToCurve then turns into a 0-1 score
+	/// Runs on the evaluation thread: only read data and this condition's properties, never live objects
+	virtual float Evaluate(const FSubjectDataView& data) const PURE_VIRTUAL(UCondition::Evaluate, return 0.0f;);
 
-	/// Use this to establish the limitation on data chunks available to this condition
-	//UPROPERTY(EditAnywhere, Category = "Condition", DisplayName = "Primary Data Type To Compare", meta = (DisplayPriority = "3"))
-	/////If desired, an alternate data type to compare primary data against
-	/////Leave as Null to compare primary data against the value specified in Primary Data
-	//TSubclassOf<T> primaryDataType = nullptr;
+	/// Replaces the RetrieveConditionDataChunks overloads
+	/// @return nullptr if the subject is missing, the key is missing, or the chunk isn't a T
+	template<typename T>
+	const T* GetChunk(const FSubjectDataView& data, ESubject inSubject, FGameplayTag inKey) const
+	{
+		if (inSubject == ESubject::None || !inKey.IsValid())
+		{
+			return nullptr;
+		}
 
-	//UPROPERTY(EditAnywhere, Category = "Condition", meta = (DisplayPriority = "4"))
-	//	///An Enum representing how the user wishes the two data types to be compared
-	//	EConditional_ conditional = EConditional_::None;
+		const FDataMap* map = data.Find(inSubject);
+		if (!map)
+		{
+			Global::Log(DATADEBUG, LogCondition, GetName(), "GetChunk", TEXT("Subject not retrieved for Description: %s. Subject: %s, Key: %s.")
+				, *description.ToString()
+				, *Global::EnumValueOnly<ESubject>(inSubject)
+				, *inKey.ToString()
+			);
+			return nullptr;
+		}
 
-	//UPROPERTY(EditAnywhere, Category = "Condition", DisplayName = "Optional Value", meta = (DisplayPriority = "5"))
-	/////Specify this value in place of a secondary subject + value
-	/////Primary data value of primary subject will be compared against this
-	//T value;
+		const FDataMapEntry* entry = map->FindEntry(inKey);
+		if (!entry)
+		{
+			Global::Log(DATADEBUG, LogCondition, GetName(), "GetChunk", TEXT("Data not retrieved for Description: %s. Subject: %s, Key: %s.")
+				, *description.ToString()
+				, *Global::EnumValueOnly<ESubject>(inSubject)
+				, *inKey.ToString()
+			);
+			return nullptr;
+		}
 
-	/// Use this to establish the limitation on data chunks available to this condition
-	//UPROPERTY(EditAnywhere, Category = "Condition", DisplayName = "Secondary Data Type To Compare Against", meta = (DisplayPriority = "7"))
-	////If desired, an alternate data type to compare primary data against
-	////Leave as Null to compare primary data against the value specified in Primary Data
-	//TSubclassOf<T> secondaryDataType = nullptr;
+		const T* chunk = entry->Get<T>();
+		if (!chunk)
+		{
+			Global::LogError(LogCondition, GetName(), "GetChunk", TEXT("Description: %s. Key %s on %s is a %s, but the condition reads %s!")
+				, *description.ToString()
+				, *inKey.ToString()
+				, *Global::EnumValueOnly<ESubject>(inSubject)
+				, entry->Chunk.GetScriptStruct() ? *entry->Chunk.GetScriptStruct()->GetName() : TEXT("invalid chunk")
+				, *T::StaticStruct()->GetName()
+			);
+		}
+		return chunk;
+	}
 
-	/////Override this method with a covarient return type to represent the data specific to the condition
-	//FORCEINLINE virtual TSubclassOf<UDataChunk> PrimaryData_Implementation() const final { return primaryDataType; }
-	
-	/////Override this method with a covarient return type to represent the data specific to the condition
-	//FORCEINLINE TSubclassOf<UDataChunk> SecondaryData_Implementation() const final { return secondaryDataType; 
+	/// The chunk of primaryKey on the primary subject
+	template<typename T>
+	const T* Primary(const FSubjectDataView& data) const
+	{
+		return GetChunk<T>(data, primarySubjectType, primaryKey);
+	}
 
-	//float EvaluateConditionInternal_Implementation(const UDataChunk* primaryDataChunk, const UDataChunk* secondaryDataChunk, class UPurposeAbilityComponent* owner) const override;
+	/// With a secondary subject: secondaryKey (or primaryKey if empty) on the secondary subject
+	/// Without one: secondaryKey on the primary subject, or nullptr if empty so the derived condition uses its own value
+	template<typename T>
+	const T* Secondary(const FSubjectDataView& data) const
+	{
+		if (secondarySubjectType != ESubject::None)
+		{
+			return GetChunk<T>(data, secondarySubjectType, secondaryKey.IsValid() ? secondaryKey : primaryKey);
+		}
+
+		return secondaryKey.IsValid() ? GetChunk<T>(data, primarySubjectType, secondaryKey) : nullptr;
+	}
 
 #pragma endregion
 

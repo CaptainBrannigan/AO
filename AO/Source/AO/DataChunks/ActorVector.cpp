@@ -4,33 +4,29 @@
 #include "ActorVector.h"
 #include "ActorReference.h"
 
-void UActorVector::CopyDataFrom(TObjectPtr<UDataChunk> ChunkToCopyFrom)
+bool FActorVectorChunk::CopyValueFrom(const FInstancedStruct& source)
 {
-	if (!ChunkToCopyFrom)
+	if (const FActorReferenceChunk* referenceSource = source.GetPtr<FActorReferenceChunk>())
 	{
-		Global::LogError(LogData, "UActorVector", "CopyDataFrom", TEXT("Incoming chunk invalid!"));
-		return;
+		Global::Log(DATATRIVIAL, LogData, "FActorVectorChunk", "CopyValueFrom", TEXT("Copying actor reference %s."), *referenceSource->Key.ToString());
+		SetValueWithActor(referenceSource->actor.Get());
+		return true;
 	}
 
-	Super::CopyDataFrom(ChunkToCopyFrom);/// If the chunk being copied is just a vector chunk
-	/// otherwise we can copy from an actor reference chunk
-	
-	Global::Log(DATATRIVIAL, LogData, "UActorVector", "CopyDataFrom", TEXT("Incoming chunk %s!"), *ChunkToCopyFrom->GetName());
-
-	if (ChunkToCopyFrom->IsA<UActorReference>())
+	if (const FActorVectorChunk* actorVectorSource = source.GetPtr<FActorVectorChunk>())
 	{
-		Global::Log(DATATRIVIAL, LogData, "UActorVector", "CopyDataFrom", TEXT("Copying %s"), Cast<UActorReference>(ChunkToCopyFrom)->Value() ? *Cast<UActorReference>(ChunkToCopyFrom)->Value()->GetName() : TEXT("Invalid Actor!"));
-		actorForLocation = Cast<UActorReference>(ChunkToCopyFrom)->Value();
-		Global::Log(DATATRIVIAL, LogData, "UActorVector", "CopyDataFrom", TEXT("Actor: %s; Location: %s."), actorForLocation ? *actorForLocation->GetName() : TEXT("Invalid Actor!"), location.ContainsNaN() ? TEXT("Invalid location") : *location.ToString());
-		return;
+		Global::Log(DATATRIVIAL, LogData, "FActorVectorChunk", "CopyValueFrom", TEXT("Copying actor vector %s."), *actorVectorSource->Key.ToString());
+		value = actorVectorSource->GetValue();
+		actor = actorVectorSource->actor;
+		return true;
 	}
 
-	if (ChunkToCopyFrom->IsA<UActorVector>())
+	if (FVectorChunk::CopyValueFrom(source))/// If the chunk being copied is just a vector chunk
 	{
-		Global::Log(DATATRIVIAL, LogData, "UActorVector", "CopyDataFrom", TEXT("Copying %s"), Cast<UActorVector>(ChunkToCopyFrom)->actorForLocation ? *Cast<UActorVector>(ChunkToCopyFrom)->actorForLocation->GetName() : TEXT("Invalid Actor!"));
-		actorForLocation = Cast<UActorVector>(ChunkToCopyFrom)->actorForLocation;
-		Global::Log(DATATRIVIAL, LogData, "UActorVector", "CopyDataFrom", TEXT("Actor: %s; Location: %s."), actorForLocation ? *actorForLocation->GetName() : TEXT("Invalid Actor!"), location.ContainsNaN() ? TEXT("Invalid location") : *location.ToString());
-		return;
+		actor = nullptr;
+		return true;
 	}
 
+	Global::LogError(LogData, "FActorVectorChunk", "CopyValueFrom", TEXT("Incoming chunk %s is not an actor or vector chunk!"), source.GetScriptStruct() ? *source.GetScriptStruct()->GetName() : TEXT("Invalid"));
+	return false;
 }

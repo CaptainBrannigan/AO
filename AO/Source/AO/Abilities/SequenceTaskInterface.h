@@ -39,16 +39,19 @@ public:
 	UPROPERTY(EditAnywhere)
 	ESubject subjectToRetrieveFrom = ESubject::Context;
 
-	UPROPERTY(EditAnywhere)
-	TSubclassOf<UDataChunk> dataToRetrieve = nullptr;
+	UPROPERTY(EditAnywhere, meta = (Categories = "Data"))
+	/// Key of the chunk to copy from subjectToRetrieveFrom (ESubject::Context = the behavior's context data)
+	FGameplayTag dataToRetrieve;
 
 	//UPROPERTY(EditAnywhere)
 	//int indexOfTaskToModify = -1;
 	//int optionalTaskIndexToSetDataOn = -1;
 	//UPROPERTY(EditAnywhere)
 	//TSubclassOf<UGameplayTask> taskToSetDataOn = nullptr;
-	UPROPERTY(EditAnywhere)
-	TSubclassOf<UDataChunk> dataToModify = nullptr;
+	UPROPERTY(EditAnywhere, meta = (Categories = "Data"))
+	/// Key of the task's chunk to copy the value into
+	/// The task's chunk keeps its key and type, FDataMapEntry::CopyValueFrom converts between types (actor reference -> move goal, etc.)
+	FGameplayTag dataToModify;
 
 };
 
@@ -65,10 +68,13 @@ struct FContextAdjustmentFromAction
 		/// 
 		ESubject subjectToAdjust = ESubject::None;
 
-	UPROPERTY(Instanced, EditAnywhere, meta = (ShowInnerProperties))
-		/// These DataChunks will either be adjusted or created 
-		/// Adjustments will be determined by enum selection provided by DataChunk
-		TObjectPtr<UDataChunk> dataAdjustment = nullptr;
+	UPROPERTY(EditAnywhere, DisplayName = "Data to Adjust", meta = (Categories = "Data"))
+		/// Key of the chunk to adjust on the subject. If the subject doesn't have it, the modifier creates it
+		FGameplayTag dataKey;
+
+	UPROPERTY(EditAnywhere, meta = (ExcludeBaseStruct))
+		/// How the chunk is adjusted (Float, Contextual Tags, Contextual History, Time...)
+		TInstancedStruct<FDataModifier> dataAdjustment;
 
 };
 
@@ -104,9 +110,9 @@ public:
 		/// 
 		FText description;
 
-	UPROPERTY(Instanced, EditAnywhere, meta = (ShowInnerProperties))
-		/// Adjust the behavior tags of this behavior to better reflect that behavior's impact
-		TObjectPtr<class UContextualTags> behaviorAdjustment = nullptr;
+	UPROPERTY(EditAnywhere, meta = (ExcludeBaseStruct))
+		/// Adjust the behavior tags of this behavior to better reflect that behavior's impact (applied to Data.BehaviorTags)
+		TInstancedStruct<FDataModifier> behaviorAdjustment;
 };
 
 

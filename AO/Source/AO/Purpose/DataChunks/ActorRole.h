@@ -3,6 +3,7 @@
 #pragma once
 
 #include "Data/Data.h"
+#include "Data/DataTags.h"
 #include "Data/GlobalLog.h"
 #include "ActorRole.generated.h"
 
@@ -18,81 +19,48 @@ enum class EActorRole : uint8
 	, Thrall UMETA(DisplayName = "Thrall")/// Type of actor unintended for independent logic processing
 };
 
-USTRUCT(BlueprintType)
-struct FRoleEntry
-{
-	GENERATED_BODY()
-
-	FRoleEntry(){}
-
-	FRoleEntry(EActorRole inRole) 
-		: role(inRole)
-	{}
-
-	UPROPERTY(EditAnywhere)
-	EActorRole role = EActorRole::None;
-
-	FORCEINLINE bool operator ==(const FRoleEntry& other) const
-	{
-		return role == other.role;
-	}
-};
-FORCEINLINE uint32 GetTypeHash(const FRoleEntry& b)
-{
-	return FCrc::MemCrc32(&b, sizeof(FRoleEntry));
-}
-
-UCLASS()
+USTRUCT(BlueprintType, meta = (DisplayName = "Actor Role"))
 /// <summary>
-/// Actor Role is a means of differentiating actors based on an arbitrary "Role"
-/// The class itself is actually a definition of a "Role"
+/// Actor Role is a means of differentiating actors based on an arbitrary "Role" (Data.Role)
 /// </summary>
-class AO_API UActorRole : public UDataChunk
+///Design: GAS GameplayTags Role; Roles are a set of labels, which is what an ASC's owned GameplayTags are (Role.AI, Role.Companion)
+/// As tags, Condition_Role becomes a tag query against the subject's tags, and roles can be granted/removed by GameplayEffects
+/// This would need the subject's owned tags snapshotted into its DataMap (an FContextualTagsChunk resolved from the ASC at snapshot)
+struct AO_API FRoleChunk : public FDataChunk
 {
 	GENERATED_BODY()
-public:
 
-	UActorRole() {}
-
-	///Overload this to require new object arguments
-	UActorRole& Initialize() { return *this; }
+	FRoleChunk() : FDataChunk(TAG_Data_Role) {}
+	explicit FRoleChunk(EActorRole inRole) : FRoleChunk() { roles.Add(inRole); }
 
 	///Important for use with DataMapInterface HasData() in determining if a DataChunk can be accessed
-	///Override this with determination of whether a value has been set for this chunk or not
-	bool HasValue() final
+	bool HasValue() const override
 	{
-		return Value().Num() > 0;
+		return roles.Num() > 0;
 	}
 
-	UPROPERTY(EditAnywhere)
-	TArray<FRoleEntry> roles;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Data")
+	TArray<EActorRole> roles;
 
-	///Value is used solely for a consistent name for getting a datachunk's value
-	///Because derivatives hold different data types, from primitive to custom, it cannot be virtual
-	const TArray<FRoleEntry>& Value() const { return roles; }
+	const TArray<EActorRole>& Value() const { return roles; }
 
-	void AddToValue(FRoleEntry inEntry) { roles.Add(inEntry); }
+	void AddToValue(EActorRole inRole) { roles.AddUnique(inRole); }
 
-	const FString ValueAsString() const
+	FString ValueAsString() const
 	{
 		FString name = "EActorRole:";
 
 		if (roles.Num() < 1) { name += ":None"; }
-		for (const FRoleEntry& role : roles)/// Add each role to the spawners name
+		for (const EActorRole role : roles)/// Add each role to the spawners name
 		{
-			name += ":" + Global::EnumValueOnly<EActorRole>(role.role);
+			name += ":" + Global::EnumValueOnly<EActorRole>(role);
 		}
 
 		return name;
 	}
 
-	///Override this to provide more detailed information about a data chunk
-	///Call Super::Description() to include string about EDataType
-	FString Description() const final
+	FString Description() const override
 	{
-		return Super::Description() + FString::Printf(TEXT("Role Num: %d"), roles.Num());
+		return FDataChunk::Description() + ValueAsString();
 	}
-
-	///If implicit conversion is desired
-	//operator insertdatatype() { return instertvaluemember; }
 };

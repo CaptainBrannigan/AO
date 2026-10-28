@@ -28,9 +28,11 @@
 //director #include "Purpose/Director_Level.h"
 #include "Purpose/DataChunks/TimeOf.h"
 #include "Purpose/DataChunks/ContextualHistory.h"
+#include "Data/DataTags.h"
 #include "Purpose/Abilities/GA_Behavior.h"
 #include "Purpose/Abilities/Behavior_AI.h"
 #include "Net/UnrealNetwork.h"
+#include "Net/Core/PushModel/PushModel.h"
 
 UPurposeAbilityComponent::UPurposeAbilityComponent(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
@@ -46,7 +48,7 @@ UPurposeAbilityComponent::UPurposeAbilityComponent(const FObjectInitializer& Obj
 //	AbilityActivatedCallbacks.AddUObject(this, &UPurposeAbilityComponent::ActionPerformed);/// Primarily set up since player input goes straight to the ability system
 //	/// But now all behavior occurrences are routed through BehaviorPerformed
 //
-//	AddData(NewObject<UContextualHistory>(this));
+//	SetData(FContextualHistoryChunk());
 //}
 
 void UPurposeAbilityComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
@@ -54,25 +56,23 @@ void UPurposeAbilityComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProper
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 	/// Here we list the variables we want to replicate + a condition if wanted
 	
-	///TODO: Network Purpose Replication; solve for doreplifetime issue here
-	DOREPLIFETIME(UPurposeAbilityComponent, data);
+	/// Push model: data is only compared for replication after OnDataMapChanged marks it dirty
+	FDoRepLifetimeParams params;
+	params.bIsPushBased = true;
+	DOREPLIFETIME_WITH_PARAMS_FAST(UPurposeAbilityComponent, data, params);
 }
 
 #pragma region Datamap Interface
 
-void UPurposeAbilityComponent::AddData_Implementation(UDataChunk* inData, bool overwriteValue)
+void UPurposeAbilityComponent::OnDataMapChanged()
 {
-	AddDataLocal(*inData, overwriteValue);
+	MARK_PROPERTY_DIRTY_FROM_NAME(UPurposeAbilityComponent, data, this);
 }
 
-void UPurposeAbilityComponent::AppendData_Implementation(const TArray<FDataMapEntry>& inDataMap, bool overwriteValue)
+void UPurposeAbilityComponent::InitializeDataForOwner()
 {
-	AppendDataLocal(inDataMap, overwriteValue);
-}
-
-void UPurposeAbilityComponent::RemoveData_Implementation(TSubclassOf<UDataChunk> inClass)
-{
-	RemoveDataLocal(inClass);
+	data.InitializeForOwner(GetAvatarActor(), this);
+	OnDataMapChanged();
 }
 
 #pragma endregion
@@ -333,6 +333,16 @@ void UPurposeAbilityComponent::OnGameplayTaskActivated(UGameplayTask& Task)
 
 }
 
+void UPurposeAbilityComponent::InitAbilityActorInfo(AActor* InOwnerActor, AActor* InAvatarActor)
+{
+	Super::InitAbilityActorInfo(InOwnerActor, InAvatarActor);
+
+	if (IsOwnerActorAuthoritative())
+	{
+		InitializeDataForOwner();
+	}
+}
+
 
 #pragma endregion
 
@@ -397,7 +407,7 @@ void UPurposeAbilityComponent::EndCurrentBehavior()
 	);
 
 	/// Crucial that on finished data adjustment is made if needed
-	CurrentBehavior().AdjustDataIfPossible(CurrentBehavior().purpose.DataAdjustments(), EPurposeSelectionEvent::OnFinished, BEHAVIOR, "EndObjective", this);
+	CurrentBehavior().AdjustDataIfPossible(EPurposeSelectionEvent::OnFinished, BEHAVIOR, "EndObjective");
 
 	if (CurrentBehavior().purpose.behaviorAbility)
 	{
@@ -448,9 +458,15 @@ void UPurposeAbilityComponent::ActionPerformed(UGameplayAbility* Ability)
 	/// Ensure the behavior history is updated
 	if (FGameplayAbilitySpec* spec = Ability->GetCurrentAbilitySpec())
 	{
-		for (int i = 0; i < spec->GetDynamicSpecSourceTags().Num(); ++i)
+		if (spec->GetDynamicSpecSourceTags().Num() > 0)
 		{
-			DataChunk<UContextualHistory>()->AddToValue(spec->GetDynamicSpecSourceTags().GetByIndex(i));
+			if (FContextualHistoryChunk* history = FindOrAddData<FContextualHistoryChunk>(TAG_Data_ContextualHistory))
+			{
+				for (int i = 0; i < spec->GetDynamicSpecSourceTags().Num(); ++i)
+				{
+					history->AddToValue(spec->GetDynamicSpecSourceTags().GetByIndex(i));
+				}
+			}
 		}
 	}
 
@@ -475,17 +491,20 @@ void UPurposeAbilityComponent::ActionPerformed(UGameplayAbility* Ability)
 	/// But there is an occurrence for each action, so the initial activation occurrence can safely be ignored
 
 	/// Establish an occurrence for the gameplay ability
+	///Design: GAS GameplayEvents Occurrences; An occurrence is "something happened, with an instigator, a target and tags", which is FGameplayEventData
+	/// Raising occurrences from SendGameplayEventToActor / HandleGameplayEvent would let abilities, cues and occurrences share one event path,
+	/// and EventTag + InstigatorTags/TargetTags could become context data without hand-building it here
 	FSubjectMap subjectMap = CurrentBehavior().subjectMap;
-	TArray<FDataMapEntry> contextData = CurrentBehavior().contextData;
+	FDataMap contextData = CurrentBehavior().contextData;
 		
-	subjectMap.subjects.Emplace(ESubject::Instigator, this);
+	subjectMap.Add(ESubject::Instigator, this);
 
 	if (CurrentBehavior().HasSubject(ESubject::Instigator))
 	{
-		subjectMap.subjects.Emplace(ESubject::EventTarget, CurrentBehavior().DataMapInterfaceForSubject(ESubject::Instigator));/// Instigator of occurrence which resulted in this behavior is the target
+		subjectMap.Add(ESubject::EventTarget, CurrentBehavior().Subject(ESubject::Instigator).Get());/// Instigator of occurrence which resulted in this behavior is the target
 	}
 
-	contextData.Add(FDataMapEntry(NewObject<UTimeOfOccurrence>(this)));
+	contextData.Set(FTimeOfOccurrenceChunk());/// Defaults to now
 
 	//PurposeSystem::Occurrence(subjectMap, contextData, director->GetPurposeEvaluationThreads());
 
@@ -552,10 +571,9 @@ void UPurposeAbilityComponent::SeekNewBehavior()
 	if (CurrentBehavior().ContextIsValid() && subjectToSetAsPreviousEventTarget != ESubject::None)
 	{
 		FSubjectMap subjects;
-		subjects.subjects.Add(ESubject::PreviousEventTarget, CurrentBehavior().DataMapInterfaceForSubject(subjectToSetAsPreviousEventTarget));/// We use a previous Event Target, because otherwise we will never lose a target until a new occurrence replaces the current target
+		subjects.Add(ESubject::PreviousEventTarget, CurrentBehavior().Subject(subjectToSetAsPreviousEventTarget).Get());/// We use a previous Event Target, because otherwise we will never lose a target until a new occurrence replaces the current target
 		
-		TArray<FDataMapEntry> contextData;
-		contextData = CurrentBehavior().contextData;
+		FDataMap contextData = CurrentBehavior().contextData;
 
 		/// For every Activity create an Occurrence with for AI to evaluate
 		//PurposeSystem::Occurrence(TArray<TObjectPtr<UPurposeAbilityComponent>>({ this }), subjects, contextData, director->GetPurposeEvaluationThreads());

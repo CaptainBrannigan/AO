@@ -29,7 +29,9 @@ void UAI_SequentialActions::ActivateAbility(const FGameplayAbilitySpecHandle Han
 	}
 
 	/// Ensure that the context data for the current behavior has a data chunk for behavior tags
-	ContextDataForBehavior().Add(FDataMapEntry(NewObject<UBehaviorTags>(this)));
+	///Design: GAS AbilityTags BehaviorTags; Behavior tags describe the running ability, which is what AbilityTags/ActivationOwnedTags are for
+	/// ActivationOwnedTags are added to the ASC while the ability runs and removed on end, so conditions could read them from the subject's tags
+	ContextDataForBehavior().Set(FBehaviorTagsChunk());
 
 	AttemptSequenceOfActions();
 }
@@ -130,39 +132,42 @@ void UAI_SequentialActions::PerformTask()
 		/// Perform any data adjustments specified on this task entry
 		for (const FTaskAndDataPair& adjustment : taskEntry.dataAdjustmentsForThisTask)
 		{
-			UDataChunk* chunkToAdjust =  Cast<IDataMapInterface>(task)->DataChunk(adjustment.dataToModify);
-			
-			UDataChunk* chunkToGetAdjustmentFrom = nullptr;
+			IDataMapInterface* taskData = Cast<IDataMapInterface>(task);
+			FDataMapEntry* chunkToAdjust = taskData ? taskData->EditDataMap().FindEntry(adjustment.dataToModify) : nullptr;
+
+			const FDataMapEntry* chunkToGetAdjustmentFrom = nullptr;
 			if (adjustment.subjectToRetrieveFrom == ESubject::Context)/// As the context data is not stored in the subjects map (isn't an IDataMapInterface), we have to manually access the data map for context
 			{
-				chunkToGetAdjustmentFrom = UDataMapGlobals::DataChunk(ContextDataForBehavior(), adjustment.dataToRetrieve);
+				chunkToGetAdjustmentFrom = ContextDataForBehavior().FindEntry(adjustment.dataToRetrieve);
 			}
 			else/// But for any other subject it will be stored via context.subjects
 			{
-				if (Vessel()->CurrentBehavior().Subject<UPurposeAbilityComponent>(adjustment.subjectToRetrieveFrom))
+				if (UPurposeAbilityComponent* subjectWithBehavior = Vessel()->CurrentBehavior().Subject<UPurposeAbilityComponent>(adjustment.subjectToRetrieveFrom))
 				{
-					TArray<FDataMapEntry> behaviorDataOfSubjectWithBehavior = Vessel()->CurrentBehavior().Subject<UPurposeAbilityComponent>(adjustment.subjectToRetrieveFrom)->DataMap();
-					behaviorDataOfSubjectWithBehavior.Append(Vessel()->CurrentBehavior().Subject<UPurposeAbilityComponent>(adjustment.subjectToRetrieveFrom)->CurrentBehavior().contextData);
-
-					chunkToGetAdjustmentFrom = UDataMapGlobals::DataChunk(behaviorDataOfSubjectWithBehavior, adjustment.dataToRetrieve);
+					/// The subject's own data first, then the data of the behavior it is performing
+					chunkToGetAdjustmentFrom = subjectWithBehavior->DataMap().FindEntry(adjustment.dataToRetrieve);
+					if (!chunkToGetAdjustmentFrom)
+					{
+						chunkToGetAdjustmentFrom = subjectWithBehavior->CurrentBehavior().contextData.FindEntry(adjustment.dataToRetrieve);
+					}
 				}
-				else
+				else if (const FDataMap* subjectData = Vessel()->CurrentBehavior().DataMapForSubject(adjustment.subjectToRetrieveFrom))
 				{
-					chunkToGetAdjustmentFrom = Vessel()->CurrentBehavior().DataChunk(adjustment.subjectToRetrieveFrom, adjustment.dataToRetrieve);
+					chunkToGetAdjustmentFrom = subjectData->FindEntry(adjustment.dataToRetrieve);
 				}
 			}
 
 			if (!chunkToAdjust || !chunkToGetAdjustmentFrom)
 			{
 				Global::Log(DATATRIVIAL, TASK, AbilityNameForLog(), "PerformTask", TEXT("DataChunk to adjust: %s; DataChunk to get adjustment from: %s.")
-					, chunkToAdjust ? *chunkToAdjust->GetName() : TEXT("invalid")
-					, chunkToGetAdjustmentFrom ? *chunkToGetAdjustmentFrom->GetName() : TEXT("invalid")
+					, chunkToAdjust ? *adjustment.dataToModify.ToString() : TEXT("invalid")
+					, chunkToGetAdjustmentFrom ? *adjustment.dataToRetrieve.ToString() : TEXT("invalid")
 				);
 				continue;
 			}
 
-			Global::Log(DATATRIVIAL, BEHAVIOR, AbilityNameForLog(), "PerformTask", TEXT("Attempting to copy %s to %s for %s!"), *chunkToGetAdjustmentFrom->GetName(), *chunkToAdjust->GetName(), *task->GetName());
-			chunkToAdjust->CopyDataFrom(chunkToGetAdjustmentFrom);
+			Global::Log(DATATRIVIAL, BEHAVIOR, AbilityNameForLog(), "PerformTask", TEXT("Attempting to copy %s to %s for %s!"), *adjustment.dataToRetrieve.ToString(), *adjustment.dataToModify.ToString(), *task->GetName());
+			chunkToAdjust->CopyValueFrom(*chunkToGetAdjustmentFrom);
 		}
 
 		bool bShouldPerformTask = true;
@@ -192,7 +197,7 @@ void UAI_SequentialActions::PerformTask()
 		/// Task may have data relevant to conditions established by pre activation, which we may need access to at the time of the occurrence
 		if (task->Implements<UDataMapInterface>())
 		{
-			AttemptToAppendTaskDataToContextData(Cast<IDataMapInterface>(task.Get())->CopyOfDataChunks(*this));
+			AttemptToAppendTaskDataToContextData(Cast<IDataMapInterface>(task.Get())->DataMap());
 		}
 
 		/// BugWatch: AbilityTasks GameplayTasks; If InitTask() is not called with this ability as the owner, then tasks will not be destroyed correctly when ability ends
@@ -222,12 +227,12 @@ void UAI_SequentialActions::PerformTask()
 			continue;
 		}
 
-		if (!adjustment.dataAdjustment)
+		if (!adjustment.dataAdjustment.IsValid())
 		{
 			continue;
 		}
 
-		Vessel()->CurrentBehavior().AdjustData(adjustment.subjectToAdjust, adjustment.dataAdjustment);
+		Vessel()->CurrentBehavior().AdjustData(adjustment.subjectToAdjust, adjustment.dataKey, adjustment.dataAdjustment.GetPtr<FDataModifier>());
 	}
 
 	/// Ordinarily ActionPerformed, and thus an ability Occurrence, is only called via ability activation
@@ -298,7 +303,7 @@ void UAI_SequentialActions::TaskFinished()
 			/// Since task is finished, let's copy what DataChunks are stored on the task to the context so that we can access them in the future
 			if (taskOfCurrentAction->Implements<UDataMapInterface>())
 			{
-				AttemptToAppendTaskDataToContextData(Cast<IDataMapInterface>(taskOfCurrentAction.Get())->CopyOfDataChunks(*this));
+				AttemptToAppendTaskDataToContextData(Cast<IDataMapInterface>(taskOfCurrentAction.Get())->DataMap());
 			}
 
 			Global::Log(DATATRIVIAL, BEHAVIOR, AbilityNameForLog(), "TaskFinished", TEXT("%s is not active, decreasing count!"), *taskOfCurrentAction->GetName());
@@ -331,7 +336,7 @@ void UAI_SequentialActions::TaskFinished()
 	Global::Log(DATADEBUGTRIVIAL, BEHAVIOR, AbilityNameForLog(), "TaskFinished", TEXT("%d active tasks left for action %s."), activeTaskCount, *sequenceOfActions[actionIndex].description.ToString());
 }
 
-void UAI_SequentialActions::AttemptToAppendTaskDataToContextData(const TArray<FDataMapEntry>& dataToAppend)
+void UAI_SequentialActions::AttemptToAppendTaskDataToContextData(const FDataMap& dataToAppend)
 {
 	if (!Vessel())
 	{
@@ -340,27 +345,15 @@ void UAI_SequentialActions::AttemptToAppendTaskDataToContextData(const TArray<FD
 		return;
 	}
 
-	for (const FDataMapEntry& entryToAdd : dataToAppend)
+	for (const FDataMapEntry& entryToAdd : dataToAppend.Entries)
 	{
-		if (!entryToAdd.Chunk || !entryToAdd.Chunk->HasValue())
+		const FDataChunk* chunk = entryToAdd.Get();
+		if (!chunk || !chunk->HasValue())
 		{
 			continue;
 		}
 
-		if (ContextDataForBehavior().Contains(entryToAdd))/// If the data is already contained, replace it
-		{
-			int indexOfEntry = -1;
-			ContextDataForBehavior().Find(entryToAdd, indexOfEntry);
-
-			if (indexOfEntry != -1)
-			{
-				ContextDataForBehavior()[indexOfEntry] = entryToAdd;
-			}
-		}
-		else /// Otherwise add a new entry
-		{
-			ContextDataForBehavior().Add(entryToAdd);
-		}
+		ContextDataForBehavior().Set(entryToAdd.Chunk);/// If the data is already contained it is replaced, otherwise added
 	}
 }
 

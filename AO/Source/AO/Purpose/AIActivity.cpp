@@ -17,8 +17,8 @@ AAIActivity::AAIActivity()
 void AAIActivity::BeginPlay()
 {
 	Super::BeginPlay();
-	data.Add(FDataMapEntry(&NewObject<UActorLocation>(this)->Initialize(this)));///
-
+	SetData(FActorLocationChunk(this));
+	data.InitializeForOwner(this, nullptr);/// Binds any chunks authored in the details panel to this activity
 }
 
 void AAIActivity::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -36,7 +36,8 @@ FContextData AAIActivity::Activity()
 {
 	Global::Log(CALLTRACEESSENTIAL, PURPOSE, *this, "SeekActivitiesInLevel", TEXT(""));
 	FContextData contextData;
-	contextData.DataMapInterfaceForSubject(ESubject::Context)->AppendData(DataMap());/// This allows us to specify context data to be evaluated against in Level on Activity
+	contextData.contextData.Append(DataMap());/// This allows us to specify context data to be evaluated against in Level on Activity
+	/// (Previously appended through DataMapInterfaceForSubject(ESubject::Context), which is never an object, so the data was dropped)
 
 	for (auto subject : SubjectMapForActivity)/// Utilize the subjects established on the Activity in Level for the EventContext data
 	{
@@ -47,19 +48,3 @@ FContextData AAIActivity::Activity()
 	Global::Log(DATATRIVIAL, PURPOSE, *this, "Activity", TEXT("%s"), *contextData.Description());
 	return contextData;
 }
-
-void AAIActivity::AddData_Implementation(UDataChunk* inData, bool overwriteValue)
-{
-	AddDataLocal(*inData, overwriteValue);
-}
-
-void AAIActivity::AppendData_Implementation(const TArray<FDataMapEntry>& inDataMap, bool overwriteValue)
-{
-	AppendDataLocal(inDataMap, overwriteValue);
-}
-
-void AAIActivity::RemoveData_Implementation(TSubclassOf<UDataChunk> inClass)
-{
-	RemoveDataLocal(inClass);
-}
-

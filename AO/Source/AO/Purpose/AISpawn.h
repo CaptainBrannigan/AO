@@ -22,11 +22,8 @@ struct FAISpawnParameters
 	{
 	}
 
-	/// <summary>
-	///  Todo: AI Spawn Management; Need to remove direct references and instead do a TArray<UDataChunk> or something
-	/// </summary>
-	UPROPERTY(EditAnywhere, Instanced, DisplayName = "Data of AI Group", meta = (ShowInnerProperties))
-	TArray<TObjectPtr<UDataChunk>> dataChunks;
+	UPROPERTY(EditAnywhere, DisplayName = "Data of AI Group", Category = "Data")
+	FDataMap data;
 
 
 };
@@ -47,7 +44,8 @@ public:
 
 	UPROPERTY(EditAnywhere, DisplayName = "Default data of AI", Category = "Group Spawn Params")
 	///This data is representative of the subject "ESubject::Candidate"
-	TArray<FDataMapEntry> data;
+	/// Spawned AI receive a copy (AppendData) and bind it to themselves with UPurposeAbilityComponent::InitializeDataForOwner
+	FDataMap data;
 
 	UPROPERTY(EditAnywhere, DisplayName = "Group Size", Category = "Group Spawn Params")
 	///How many of role are spawned into level
@@ -100,23 +98,12 @@ private:
 #pragma region Datamap Interface
 public:
 
-	const TArray<FDataMapEntry>& DataMap() final { return data; }
-	TArray<FDataMapEntry> DataMapCopy() final { return data; }
+	const FDataMap& DataMap() const final { return data; }
 
-	UFUNCTION(Server, Unreliable)
-		void AddData(UDataChunk* inData, bool overwriteValue = true) final;
-
-	UFUNCTION(Server, Unreliable)
-		void AppendData(const TArray<FDataMapEntry>& inDataMap, bool overwriteValue = true) final;
-
-	UFUNCTION(Server, Unreliable)
-		void RemoveData(TSubclassOf<UDataChunk> inClass) final;
-
-protected:
+private:
 
 	/// Force implementers to provide an editable datamap
-	/// The only way to the change the DataMap is through the Server RPCs
-	TArray<FDataMapEntry>& DataMapInternal() final { return data; }
+	FDataMap& MutableDataMap() final { return data; }
 
 #pragma endregion
 };

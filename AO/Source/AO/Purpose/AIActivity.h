@@ -33,17 +33,7 @@ public:
 	/// Default bActorCanEverTick = false
 	virtual void Tick(float DeltaTime) override;
 
-	const TArray<FDataMapEntry>& DataMap() final { return data; }
-	TArray<FDataMapEntry> DataMapCopy() final { return data; }
-
-	UFUNCTION(Server, Reliable)
-	void AddData(UDataChunk* inData, bool overwriteValue = true) final;
-
-	UFUNCTION(Server, Reliable)
-	void AppendData(const TArray<FDataMapEntry>& inDataMap, bool overwriteValue = true) final;
-
-	UFUNCTION(Server, Reliable)
-	void RemoveData(TSubclassOf<UDataChunk> inClass) final;
+	const FDataMap& DataMap() const final { return data; }
 
 	/// Design: Purpose Activity; Have Activity use data to specify when occurrence for Activity is called
 		/// Such as a time of day
@@ -64,13 +54,16 @@ public:
 	///// Data relevant to this activity can be stored here
 	//TArray<TObjectPtr<UDataChunk>> dataChunks;
 
-	UPROPERTY(EditAnywhere)
+	UPROPERTY(EditAnywhere, Category = "Data")
 	///This data is representative of the subject "ESubject::Context"
-	TArray<FDataMapEntry> data;
+	FDataMap data;
+
+private:
 
 	/// Force implementers to provide an editable datamap
-	/// The only way to the change the DataMap is through the Server RPCs
-	TArray<FDataMapEntry>& DataMapInternal() final { return data; }
+	FDataMap& MutableDataMap() final { return data; }
+
+public:
 
 	UPROPERTY(EditAnywhere)
 	///This data is representative of the subject "ESubject::Context"

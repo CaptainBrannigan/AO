@@ -8,11 +8,14 @@
 #include "Purpose/DataChunks/FloatChunk.h"
 #include "DataChunks/ActorVector.h"
 #include "DataChunks/ActorReference.h"
+#include "Data/DataTags.h"
 #include "Engine/EngineTypes.h"
 #include "AITypes.h"
 #include "Navigation/PathFollowingComponent.h"
 #include "Tasks/AITask.h"
 #include "AT_MoveTo.generated.h"
+
+class UPurposeAbilityComponent;
 
 /// Debug: AI MoveTo Behavior PlayerPerception; Ensure failed which also broke player perception eqs
 /*
@@ -82,16 +85,11 @@
 
 */
 
-UCLASS(MinimalAPI)
-class UMovementSpeed : public UFloatChunk { GENERATED_BODY() };
-
-UCLASS(MinimalAPI)
-class UMoveGoal : public UActorVector { GENERATED_BODY() };
-
-UCLASS(MinimalAPI)
-class UPathLength : public UFloatChunk{ GENERATED_BODY() };
-UCLASS(MinimalAPI)
-class UTimeLengthOfMovement : public UFloatChunk { GENERATED_BODY() };
+/// Task data (Data/DataTags.h), previously UMovementSpeed, UMoveGoal, UPathLength and UTimeLengthOfMovement
+/// Data.Task.MoveTo.Speed		FFloatChunk, m/s
+/// Data.Task.MoveTo.Goal		FActorVectorChunk, an actor to move to or a location
+/// Data.Task.MoveTo.PathLength	FFloatChunk, meters, set after activation
+/// Data.Task.MoveTo.Duration	FFloatChunk, seconds, set after activation
 
 UCLASS(BlueprintType, Blueprintable, EditInlineNew)
 class UAT_MoveTo : public UAITask, public ISequenceTaskInterface, public IDataMapInterface
@@ -131,9 +129,13 @@ public:
 	{
 		if (Path.IsValid())
 		{
-			DataChunk<UPathLength>()->value = Path->GetLength() / 100;/// / 100 to translate from uu to meters
-			DataChunk<UTimeLengthOfMovement>()->value = (Path->GetLength() / 100) / DataChunk<UMovementSpeed>()->value;/// / 100 to translate from uu to meters
-			Global::Log(DATATRIVIAL, TASK, GetName(), "PostActivationAdjustment", TEXT("Path Length: %f. Move speed: %f. Time Length: %f."), Path->GetLength(), DataChunk<UMovementSpeed>()->value, DataChunk<UTimeLengthOfMovement>()->value);
+			const FFloatChunk* moveSpeed = DataChunk<FFloatChunk>(TAG_Data_Task_MoveTo_Speed);
+			const float speed = moveSpeed && moveSpeed->GetValue() > 0.0f ? moveSpeed->GetValue() : 3.5f;/// Same fallback as PreActivationInitialization's 350uu
+			const float pathLengthMeters = Path->GetLength() / 100;/// / 100 to translate from uu to meters
+
+			if (FFloatChunk* pathLength = EditData<FFloatChunk>(TAG_Data_Task_MoveTo_PathLength)) { pathLength->value = pathLengthMeters; }
+			if (FFloatChunk* duration = EditData<FFloatChunk>(TAG_Data_Task_MoveTo_Duration)) { duration->value = pathLengthMeters / speed; }
+			Global::Log(DATATRIVIAL, TASK, GetName(), "PostActivationAdjustment", TEXT("Path Length: %f. Move speed: %f. Time Length: %f."), Path->GetLength(), speed, pathLengthMeters / speed);
 			
 			return true;
 		}
@@ -155,19 +157,14 @@ public:
 		FGameplayTagContainer contextualTagForTask;
 
 	///Allows evaluations to retrieve chunks of data from any type of object implementing interface
-	const TArray<FDataMapEntry>& DataMap() final { return dataMap; }
-	TArray<FDataMapEntry> DataMapCopy() final { return dataMap; }
+	const FDataMap& DataMap() const final { return dataMap; }
 
-	void AddData(UDataChunk* inData, bool overwriteValue = true) final { AddDataLocal(*inData); }
-	void AppendData(const TArray<FDataMapEntry>& inDataMap, bool overwriteValue = true) final { AppendDataLocal(inDataMap); }
-	void RemoveData(TSubclassOf<UDataChunk> inClass) final { RemoveDataLocal(inClass); }
 
 	UPROPERTY(EditAnywhere)
-	TArray<FDataMapEntry> dataMap;
+	FDataMap dataMap;
 
 	/// Force implementers to provide an editable datamap
-	/// The only way to the change the DataMap is through the Server RPCs
-	TArray<FDataMapEntry>& DataMapInternal() final { return dataMap; }
+	FDataMap& MutableDataMap() final { return dataMap; }
 
 protected:
 

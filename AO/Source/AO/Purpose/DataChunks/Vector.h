@@ -4,61 +4,44 @@
 #include "Data/GlobalLog.h"
 #include "Vector.generated.h"
 
-UCLASS(Abstract, BlueprintType, Blueprintable)
+USTRUCT(BlueprintType, meta = (DisplayName = "Vector"))
 /// <summary>
-/// Base class for FVector type data
+/// Base type for FVector data
 /// </summary>
-class AO_API UVectorChunk : public UDataChunk
+struct AO_API FVectorChunk : public FDataChunk
 {
 	GENERATED_BODY()
-public:
 
-	UVectorChunk() {}
-
-	///Overload this to require new object arguments
-	UVectorChunk& Initialize() { return *this; }
-
-public:
+	FVectorChunk() {}
+	explicit FVectorChunk(FGameplayTag inKey) : FDataChunk(inKey) {}
 
 	///Important for use with DataMapInterface HasData() in determining if a DataChunk can be accessed
-	///Override this with determination of whether a value has been set for this chunk or not
-	bool HasValue() override { return !location.ContainsNaN() && location != FVector::ZeroVector; }
+	bool HasValue() const override { return !value.ContainsNaN() && value != FVector::ZeroVector; }
 
-	///Value is used solely for a consistent name for getting a datachunk's value
-	///Because derivatives hold different data types, from primitive to custom, it cannot be virtual
-	virtual const FVector Value() const { return location; }
+	/// Virtual so derived chunks can compute their value. Conditions call this, never value directly
+	/// Overrides must be safe on the evaluation thread
+	virtual FVector GetValue() const { return value; }
 
-	void SetValue(FVector inValue) { location = inValue; }
+	void SetValue(FVector inValue) { value = inValue; }
 
-	void CopyDataFrom(TObjectPtr<UDataChunk> ChunkToCopyFrom) override 
+	/// Any vector chunk can be copied into any other, regardless of name
+	bool CopyValueFrom(const FInstancedStruct& source) override
 	{
-		if (!ChunkToCopyFrom)
+		if (const FVectorChunk* vectorSource = source.GetPtr<FVectorChunk>())
 		{
-			Global::LogError(LogData, "UVectorChunk", "CopyDataFrom", TEXT("Incoming chunk invalid!"));
-			return;
+			SetValue(vectorSource->GetValue());
+			return true;
 		}
-
-		if (!ChunkToCopyFrom->IsA<UVectorChunk>())
-		{
-			Global::LogError(LogData, "UVectorChunk", "CopyDataFrom", TEXT("Incoming chunk %s not a vector chunk!"), *ChunkToCopyFrom->GetName());
-			return;
-		}
-
-		SetValue(Cast<UVectorChunk>(ChunkToCopyFrom)->Value());
+		return false;
 	}
 
-	///Override this to provide more detailed information about a data chunk
-	///Call Super::Description() to include string about EDataType
-	virtual FString Description() const
+	FString Description() const override
 	{
-		return TEXT("Type: ") + GetClass()->GetName() + TEXT(" ");
+		return FDataChunk::Description() + TEXT("Value: ") + GetValue().ToString();
 	}
-
-	///If implicit conversion is desired
-	//operator insertdatatype() { return instertvaluemember; }
 
 protected:
 
-	UPROPERTY(VisibleAnywhere)
-	FVector location = FVector::ZeroVector;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Data")
+	FVector value = FVector::ZeroVector;
 };

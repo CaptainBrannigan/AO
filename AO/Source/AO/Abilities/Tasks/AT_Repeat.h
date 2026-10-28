@@ -5,15 +5,14 @@
 #include "Abilities/SequenceTaskInterface.h"
 #include "Data/GlobalLog.h"
 #include "Data/DataMapInterface.h"
-#include "Purpose/Datachunks/FloatChunk.h"
+#include "Purpose/DataChunks/FloatChunk.h"
+#include "Data/DataTags.h"
 #include "AT_Repeat.generated.h"
 
 
-UCLASS(MinimalAPI)
-class UActionPerformanceDesired : public UFloatChunk { GENERATED_BODY() };
-
-UCLASS(MinimalAPI)
-class UTimeBetweenActions : public UFloatChunk { GENERATED_BODY() };
+/// Task data (Data/DataTags.h), previously UActionPerformanceDesired and UTimeBetweenActions
+/// Data.Task.Repeat.Count		FFloatChunk, number of actions
+/// Data.Task.Repeat.Interval	FFloatChunk, seconds between actions
 
 UCLASS(BlueprintType, Blueprintable, EditInlineNew)
 class UAT_Repeat : public UAbilityTask_Repeat, public ISequenceTaskInterface, public IDataMapInterface
@@ -24,8 +23,8 @@ public:
 	UAT_Repeat(const FObjectInitializer& ObjectInitializer)
 		: Super(ObjectInitializer)
 	{
-		AddData(CreateDefaultSubobject<UActionPerformanceDesired>("NumberOfActionsDesired"));
-		AddData(CreateDefaultSubobject<UTimeBetweenActions>("TimeBetweenActions"));
+		dataMap.Set(FFloatChunk(TAG_Data_Task_Repeat_Count));
+		dataMap.Set(FFloatChunk(TAG_Data_Task_Repeat_Interval));
 	}
 
 	/** Start a task that repeats an action or set of actions. */
@@ -42,9 +41,9 @@ public:
 	bool PreActivationInitialization(const FActionSequenceEntry& entryData, class UAI_SequentialActions& source) override 
 	{
 		///ActionPerformancesDesired = entryData.maxInputCount;
-		ActionPerformancesDesired = DataChunk<UActionPerformanceDesired>()->value;
+		ActionPerformancesDesired = DataChunk<FFloatChunk>(TAG_Data_Task_Repeat_Count) ? DataChunk<FFloatChunk>(TAG_Data_Task_Repeat_Count)->GetValue() : 0;
 		///TimeBetweenActions = entryData.periodOfInput;
-		TimeBetweenActions = DataChunk<UTimeBetweenActions>()->value;
+		TimeBetweenActions = DataChunk<FFloatChunk>(TAG_Data_Task_Repeat_Interval) ? DataChunk<FFloatChunk>(TAG_Data_Task_Repeat_Interval)->GetValue() : 0.0f;
 		ActionCounter = 0;
 
 		FScriptDelegate finishDel;
@@ -77,17 +76,12 @@ public:
 		FGameplayTagContainer contextualTagForTask;
 
 	///Allows evaluations to retrieve chunks of data from any type of object implementing interface
-	const TArray<FDataMapEntry>& DataMap() final { return dataMap; }
-	TArray<FDataMapEntry> DataMapCopy() final { return dataMap; }
+	const FDataMap& DataMap() const final { return dataMap; }
 
-	void AddData(UDataChunk* inData, bool overwriteValue = true) final { AddDataLocal(*inData); }
-	void AppendData(const TArray<FDataMapEntry>& inDataMap, bool overwriteValue = true) final { AppendDataLocal(inDataMap); }
-	void RemoveData(TSubclassOf<UDataChunk> inClass) final { RemoveDataLocal(inClass); }
 
 	UPROPERTY(EditAnywhere)
-		TArray<FDataMapEntry> dataMap;
+		FDataMap dataMap;
 
 	/// Force implementers to provide an editable datamap
-	/// The only way to the change the DataMap is through the Server RPCs
-	TArray<FDataMapEntry>& DataMapInternal() final { return dataMap; }
+	FDataMap& MutableDataMap() final { return dataMap; }
 };

@@ -2,77 +2,28 @@
 
 #pragma once
 
-#include "Purpose/DataChunks/Vector.h"
-#include "GameFramework/Actor.h"
-#include "Kismet/KismetMathLibrary.h"
-#include "Purpose/PurposeAbilityComponent.h"
+#include "ActorVector.h"
+#include "Data/DataTags.h"
 #include "ActorVelocity.generated.h"
 
-UCLASS(MinimalAPI)
+USTRUCT(BlueprintType, meta = (DisplayName = "Actor Velocity"))
 /// <summary>
-///
+/// The actor's velocity (Data.Velocity), read at snapshot so Condition_Velocity never touches the actor on the evaluation thread
 /// </summary>
-class UActorVelocity : public UVectorChunk
+struct AO_API FActorVelocityChunk : public FActorVectorChunk
 {
 	GENERATED_BODY()
-public:
 
-	UActorVelocity() {}
-
-	/// While it can not be overloaded, this method will provide datachunks the opportunity to access their outer object and potentially initialize themselves from there
-	UDataChunk& NonOverloadInitialize() final
+	FActorVelocityChunk()
+		: FActorVectorChunk(TAG_Data_Velocity)
 	{
-		if (GetOuter() && GetOuter()->IsA<UPurposeAbilityComponent>())
-		{
-			Global::Log(DATATRIVIAL, LogData, "UActorReference", "NonOverloadInitialize", TEXT("Was able to initialize actor with avatar actor of outer."));
-			actor = Cast<UPurposeAbilityComponent>(GetOuter())->GetAvatarActor();
-		}
-		return *this;
+		bBindToOwner = true;
 	}
 
-	///Overload this to require new object arguments
-	UActorVelocity& Initialize()
-	{
-		return *this;
-	}
+	/// A zero velocity is a valid value, so only the actor matters
+	bool HasValue() const override { return HasActor(); }
 
-	UActorVelocity& Initialize(TObjectPtr<AActor> inActor)
-	{
-		actor = inActor;
-		return *this;
-	}
+protected:
 
-	///Important for use with DataMapInterface HasData() in determining if a DataChunk can be accessed
-	///Override this with determination of whether a value has been set for this chunk or not
-	bool HasValue() final
-	{
-		return IsValid(actor);
-	}
-
-	UPROPERTY(EditAnywhere)
-		TObjectPtr<AActor> actor = nullptr;
-
-	UFUNCTION(BlueprintCallable)
-	/// @return FVector: If actor is valid, their current velocity, else a zero vector
-	const FVector Value() const final
-	{
-		if (IsValid(actor))
-		{
-			return actor->GetVelocity();
-		}
-		else
-		{
-			return FVector::ZeroVector;
-		}
-	}
-
-	///Override this to provide more detailed information about a data chunk
-	///Call Super::Description() to include string about EDataType
-	FString Description() const final
-	{
-		return Super::Description() + TEXT("Actor Velocity: ") + (IsValid(actor) ? actor->GetVelocity().ToString() : ("Actor Invalid!"));
-	}
-
-	///If implicit conversion is desired
-	//operator insertdatatype() { return instertvaluemember; }
+	FVector ReadFromActor(const AActor& inActor) const override { return inActor.GetVelocity(); }
 };

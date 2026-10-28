@@ -10,12 +10,9 @@
 #include "Abilities/SequenceTaskInterface.h"
 #include "Data/DataMapInterface.h"
 #include "DataChunks/ActorVector.h"
+#include "Data/DataTags.h"
 #include "GameplayTaskResource.h"
 #include "AT_FaceDirection.generated.h"
-
-UCLASS(MinimalAPI)
-/// 
-class ULocationToFace : public UActorVector { GENERATED_BODY() };
 
 UCLASS()
 class UTask_Resource_Rotation : public UGameplayTaskResource { GENERATED_BODY() };
@@ -32,7 +29,7 @@ public:
 	UAT_FaceDirection(const FObjectInitializer& ObjectInitializer)
 		: Super(ObjectInitializer)
 	{
-		AddData(CreateDefaultSubobject<ULocationToFace>("LocationToFace"));
+		dataMap.Set(FActorVectorChunk(TAG_Data_Task_FaceDirection_Location));
 		bTickingTask = true;
 	}
 
@@ -43,7 +40,7 @@ public:
 
 	bool PreActivationInitialization(const FActionSequenceEntry& entryData, class UAI_SequentialActions& source) override
 	{
-		if (!HasData(ULocationToFace::StaticClass()))
+		if (!HasData(TAG_Data_Task_FaceDirection_Location))
 		{
 			return false;
 		}
@@ -92,19 +89,14 @@ protected:
 	FSequenceTaskFinished taskFinished;
 
 	///Allows evaluations to retrieve chunks of data from any type of object implementing interface
-	const TArray<FDataMapEntry>& DataMap() final { return dataMap; }
-	TArray<FDataMapEntry> DataMapCopy() final { return dataMap; }
+	const FDataMap& DataMap() const final { return dataMap; }
 
-	void AddData(UDataChunk* inData, bool overwriteValue = true) final { AddDataLocal(*inData); }
-	void AppendData(const TArray<FDataMapEntry>& inDataMap, bool overwriteValue = true) final { AppendDataLocal(inDataMap); }
-	void RemoveData(TSubclassOf<UDataChunk> inClass) final { RemoveDataLocal(inClass); }
 
 	UPROPERTY(EditAnywhere)
-		TArray<FDataMapEntry> dataMap;
+		FDataMap dataMap;
 
 	/// Force implementers to provide an editable datamap
-	/// The only way to the change the DataMap is through the Server RPCs
-	TArray<FDataMapEntry>& DataMapInternal() final { return dataMap; }
+	FDataMap& MutableDataMap() final { return dataMap; }
 
 	UPROPERTY(BlueprintReadWrite)
 		TObjectPtr<class AAIController> actorCache = nullptr;

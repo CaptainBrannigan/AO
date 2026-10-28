@@ -4,6 +4,9 @@
 
 #include "CoreMinimal.h"
 #include "HAL/Runnable.h"
+#include "Containers/Queue.h"
+#include <atomic>
+#include "UObject/ObjectKey.h"
 #include "Data/GlobalLog.h"
 #include "Data/Data.h"
 #include "Condition.h"
@@ -37,26 +40,31 @@ enum class EPurposeSelectionEvent : uint8
 };
 
 USTRUCT()
+/// When a purpose is selected or finished, change (or create) one chunk on one subject
+/// See FDataModifier for what modifiers are for
 struct AO_API FPurposeModificationEntry
 {
 	GENERATED_BODY()
 
-		UPROPERTY(EditAnywhere)
-		/// A specifier indicating when to make an adjustment
-		FText description;
+	UPROPERTY(EditAnywhere, Category = "Data Adjustment")
+	/// A specifier indicating when to make an adjustment
+	FText description;
 
-	UPROPERTY(EditAnywhere)
-		/// A specifier indicating when to make an adjustment
-		EPurposeSelectionEvent selectionEvent = EPurposeSelectionEvent::None;
+	UPROPERTY(EditAnywhere, Category = "Data Adjustment")
+	/// A specifier indicating when to make an adjustment
+	EPurposeSelectionEvent selectionEvent = EPurposeSelectionEvent::None;
 
-	UPROPERTY(EditAnywhere, DisplayName = "Target of Adjusted Data")
-		/// 
-		ESubject subjectToAdjust = ESubject::None;
+	UPROPERTY(EditAnywhere, Category = "Data Adjustment", DisplayName = "Target of Adjusted Data")
+	///
+	ESubject subjectToAdjust = ESubject::None;
 
-	UPROPERTY(Instanced, EditAnywhere, meta = (ShowInnerProperties))
-		/// These DataChunks will either be adjusted or created 
-		/// Adjustments will be determined by enum selection provided by DataChunk
-		TObjectPtr<UDataChunk> dataAdjustment = nullptr;
+	UPROPERTY(EditAnywhere, Category = "Data Adjustment", DisplayName = "Data to Adjust", meta = (Categories = "Data"))
+	/// Key of the chunk to adjust on the subject. If the subject doesn't have it, the modifier creates it
+	FGameplayTag dataKey;
+
+	UPROPERTY(EditAnywhere, Category = "Data Adjustment", meta = (ExcludeBaseStruct))
+	/// How the chunk is adjusted (Float, Contextual Tags, Contextual History, Time...)
+	TInstancedStruct<FDataModifier> dataAdjustment;
 
 };
 
@@ -74,26 +82,28 @@ public:
 		dataAdjustmentsForPurposeEvents = TArray<FPurposeModificationEntry>();
 	}
 
-	UPROPERTY(EditAnywhere, meta = (DisplayPriority = "0"))
+	UPROPERTY(EditAnywhere, Category = "Purpose", meta = (DisplayPriority = "0"))
 	FString descriptionOfPurpose = "";
 
-	UPROPERTY(Instanced, EditAnywhere, meta = (TitleProperty=description, ShowInnerProperties))
+	UPROPERTY(Instanced, EditAnywhere, Category = "Purpose", meta = (TitleProperty=description, ShowInnerProperties))
 		/// These conditions establish how a purpose fits to a context
 		/// They are critical to create legible and realistic purpose for both individual actors and groups of actors
 		/// The more conditions present, the greater the potential weight of a purpose
 	TArray<TObjectPtr<UCondition>> conditions;
 	const TArray<TObjectPtr<UCondition>>& GetConditions() const { return conditions; }
 
-	UPROPERTY(EditAnywhere, meta = (TitleProperty=description))
-		/// These DataChunks will either be adjusted or created 
-		/// Adjustments will be determined by enum selection provided by DataChunk
+	UPROPERTY(EditAnywhere, Category = "Purpose", meta = (TitleProperty=description))
+		/// These DataChunks will either be adjusted or created
+		/// Adjustments are determined by the modifier selected on each entry
 	TArray<FPurposeModificationEntry> dataAdjustmentsForPurposeEvents;
 
-	//UPROPERTY(EditAnywhere, meta=(InlineEditConditionToggle, EditConditionHides, EditCondition = "!canEditSubPurposes"))
-	//TObjectPtr<class UBehaviorTree> BT = nullptr;
-	UPROPERTY(Instanced, EditAnywhere, DisplayName = "Behavior")
+	UPROPERTY(Instanced, EditAnywhere, Category = "Purpose", DisplayName = "Behavior")
 		TObjectPtr<class UBehavior_AI> behaviorAbility = nullptr;
 
+	///Design: GAS GameplayAbilities Purpose; A purpose is "conditions that score whether an ability should run" + "the ability"
+	/// GAS already has the activation half: ActivationRequiredTags/BlockedTags, CanActivateAbility and Cost/Cooldown GameplayEffects
+	/// Cheap tag gates on behaviorAbility could pre-filter purposes before any condition is scored (a required tag missing = skip the purpose)
+	/// Cooldown effects would also replace hand-rolled "don't repeat this behavior for N seconds" history conditions
 
 	/// @param potentialScore = every condition with a exponential decay additional (1 + decaying additional)
 	/// @param totalWeight = The weight of each condition->weight added together
@@ -131,48 +141,48 @@ public:
 };
 
 USTRUCT(BlueprintType)
+/// The subjects of a context: which object fills each ESubject role
+/// Subjects are held weakly: a context never keeps a subject alive, and a destroyed subject is detected safely
+/// (Previously TScriptInterface, which GC didn't track because contexts aren't UPROPERTYs, so a destroyed subject was a dangling pointer)
 struct AO_API FSubjectMap
 {
 	GENERATED_BODY()
 public:
 
+	FSubjectMap() {}
 
-	/// In case at some point we attempt to return an empty FSubjectMap, ensure everything has default empty values
-	/// Ran into a bug where an return FGameplayTagContainer(); had thousands of gameplaytag entries
-	FSubjectMap()
-	{
-		subjects = TMap<ESubject, TScriptInterface<IDataMapInterface>>();
-	}
-
-	FSubjectMap(TMap<ESubject, TScriptInterface<IDataMapInterface>> inSubjects)
-		: subjects(inSubjects)
-	{
-
-	}
-
-	UPROPERTY(VisibleAnywhere)
+	UPROPERTY(VisibleAnywhere, Category = "Purpose")
 	///Link an enum representing a subject with a corresponding object which holds DataChunks
-	TMap<ESubject, TScriptInterface<IDataMapInterface>> subjects;
-	
-	TMap<ESubject, TArray<FDataMapEntry>> GetSubjectsAsDataMaps() const
+	TMap<ESubject, TWeakObjectPtr<UObject>> subjects;
+
+	/// Game thread. Objects that don't implement IDataMapInterface are refused
+	bool Add(ESubject inSubject, UObject* inObject)
 	{
-		TMap<ESubject, TArray<FDataMapEntry>> SubjectDataMap;
-
-		for (TPair<ESubject, TScriptInterface<IDataMapInterface>> subject : subjects)
+		if (!IsValid(inObject) || !inObject->Implements<UDataMapInterface>())
 		{
-			//if (!IsValid(subject.Value.GetObject()))
-			//if (!IsValid(subject.Value.GetObject()) || !Cast<IDataMapInterface>(subject.Value.GetObject()))
-			if (!IsValid(subject.Value.GetObject()) || !subject.Value.GetObject()->Implements<UDataMapInterface>())
-			{
-				Global::LogError(PURPOSE, "FContextData", "GetSubjectAsDataMaps", TEXT("Subject %s value is invalid!."), *Global::EnumValueOnly<ESubject>(subject.Key));
-				continue;
-			}
-
-			SubjectDataMap.Add(subject.Key, subject.Value->DataMapCopy());
+			return false;
 		}
-
-		return SubjectDataMap;
+		subjects.Add(inSubject, inObject);
+		return true;
 	}
+
+	bool Add(ESubject inSubject, const TScriptInterface<IDataMapInterface>& inObject) { return Add(inSubject, inObject.GetObject()); }
+
+	/// Game thread
+	UObject* Get(ESubject inSubject) const
+	{
+		const TWeakObjectPtr<UObject>* subject = subjects.Find(inSubject);
+		return subject ? subject->Get() : nullptr;
+	}
+
+	/// Game thread
+	TScriptInterface<IDataMapInterface> Interface(ESubject inSubject) const
+	{
+		return TScriptInterface<IDataMapInterface>(Get(inSubject));
+	}
+
+	/// Game thread
+	bool Contains(ESubject inSubject) const { return Get(inSubject) != nullptr; }
 };
 
 USTRUCT(BlueprintType)
@@ -185,19 +195,18 @@ public:
 
 	/// In case at some point we attempt to return an empty FContextData, ensure everything has default empty values
 	/// Ran into a bug where an return FGameplayTagContainer(); had thousands of gameplaytag entries
-	FContextData() 
+	FContextData()
 	{
 		cachedScoreOfPurpose = 0.0f;
-		contextData = TArray<FDataMapEntry>();
 	}
 
-	FContextData(FPurpose inPurpose, FSubjectMap inSubjectMap, TArray<FDataMapEntry> inContextData, TWeakObjectPtr<UPurposeAbilityComponent> inPurposeOwner)
+	FContextData(const FPurpose& inPurpose, const FSubjectMap& inSubjectMap, const FDataMap& inContextData, TWeakObjectPtr<UPurposeAbilityComponent> inPurposeOwner, const FString& inOwnerName = "")
 		: purpose(inPurpose)
 		, subjectMap(inSubjectMap)
 		, contextData(inContextData)
 		, purposeOwner(inPurposeOwner)
 	{
-		contextDataPurposeName = purpose.descriptionOfPurpose + "(" + GetOwnerName() + ")";
+		contextDataPurposeName = purpose.descriptionOfPurpose + "(" + inOwnerName + ")";
 	}
 
 	FPurpose purpose;
@@ -205,22 +214,24 @@ public:
 	/// We store the score of the purpose at the time of it's selection so that we may easily compare purposes against each other outside of purpose selection for an individual
 	float cachedScoreOfPurpose = 0;
 
+	/// FPlatformTime::Seconds() when the occurrence that selected this purpose was snapshot. 0 for contexts that didn't come from an occurrence
+	double snapshotTimeSeconds = 0.0;
+
 	/// Essentially this is the context
 	/// Every context will store relevant ESubjects with their data maps to be evaluated against Conditions
 	FSubjectMap subjectMap;
 
-	/// Refactor: purpose PurposeEvaluation; We can actually combine the contextData and FSubjectMap by turning the FSubjectMap into a TMap<ESubject, FDataMapEntry> at evaluation time
 	/// We can store data specific to the context and not a subject here, such as a last known position, a type of sound heard, etc.
-	TArray<FDataMapEntry> contextData;
+	/// During evaluation this is the ESubject::Context subject
+	FDataMap contextData;
 
 	TWeakObjectPtr<UPurposeAbilityComponent> purposeOwner = nullptr;
 
 	inline bool ContextIsValid() const { return purpose.GetConditions().Num() > 0; }
 
-	//inline bool HasPurpose() { return purpose.SubPurposes.Num() > 0 || purpose.BehaviorAbility; }
 	inline bool HasPurpose() const { return purpose.conditions.Num() > 0; }
 
-	FString GetOwnerName();
+	FString GetOwnerName() const;
 
 	///@return FString: If a purpose has been found for this contextData, returns the name of the purpose itself
 	FORCEINLINE FString GetName() const
@@ -228,124 +239,39 @@ public:
 		return contextDataPurposeName;
 	}
 
-	FString Description() const
-	{
-		FString name = GetName();
-		//Global::Log(DATADEBUG, PURPOSE, "FContextData", "Description", TEXT("Description of %s."), *name);
-		for (const TPair<ESubject, TScriptInterface<IDataMapInterface>>& subject : subjectMap.subjects)
-		{
-			//Global::Log(DATADEBUG, PURPOSE, "FContextData", "Description", TEXT("Subject: %s Value: %s. FContextData::Description"), *UEnum::GetValueAsString(subject.Key), *subject.Value.GetObject()->GetName());
-			if (!subject.Value.GetObject())
-			{
-				/*Global::Log(DATADEBUG, PURPOSE, "FContextData", "Description", TEXT("Subject invalid! %s: Subject: %s. Actor: %s.")
-					, *name
-					, *Global::EnumValueOnly<ESubject>(subject.Key)
-					, IsValid(subject.Value.GetObject()) ? *subject.Value.GetObject()->GetName() : TEXT("Invalid")
-				);*/
-				name += LINE_TERMINATOR;
-				name += FString::Printf(TEXT("Subject invalid! Subject: %s. Actor: %s.")
-					, *Global::EnumValueOnly<ESubject>(subject.Key)
-					, IsValid(subject.Value.GetObject()) ? *subject.Value.GetObject()->GetName() : TEXT("Invalid")
-				);
-				continue;
-			}
-			for (const FDataMapEntry& dataChunk : subject.Value->DataMap())
-			{
-				/*Global::Log( DATADEBUG, PURPOSE, "FContextData", "Description", TEXT("%s: Subject: %s. Actor: %s. DataChunk: %s.")
-					, *name
-					, *Global::EnumValueOnly<ESubject>(subject.Key)
-					, IsValid(subject.Value.GetObject()) ?  *subject.Value.GetObject()->GetName() : TEXT("Invalid")
-					, IsValid(dataChunk.Chunk) ? *dataChunk.Chunk->Description() : TEXT("Invalid")
-				);	*/
-				name += LINE_TERMINATOR;
-				name += FString::Printf(TEXT("Subject: %s. Actor: %s. DataChunk: %s.")
-					, *Global::EnumValueOnly<ESubject>(subject.Key)
-					, IsValid(subject.Value.GetObject()) ? *subject.Value.GetObject()->GetName() : TEXT("Invalid")
-					, IsValid(dataChunk.Chunk) ? *dataChunk.Chunk->Description() : TEXT("Invalid")
-				);
-			}
-		}
-
-		return *name;
-	}
+	/// Game thread
+	FString Description() const;
 
 	/// This could be unnecessarily expensive, and if we aren't actually going to log it no reason to bother
-	FString Description(EHierarchicalCalltraceVerbosity verbosity)
+	FString Description(EHierarchicalCalltraceVerbosity verbosity) const
 	{
 		const UGlobalLogSettings* LogSettings = GetDefault<UGlobalLogSettings>();
 
-		if (!LogSettings)
+		if (!LogSettings || static_cast<int>(LogSettings->GlobalLogVerbosity) < static_cast<int>(verbosity))
 		{
-			return "";
-		}
-
-		if (static_cast<int>(LogSettings->GlobalLogVerbosity) < static_cast<int>(verbosity))
-		{
-			//		UE_LOG(LogTemp, Log, TEXT("HV: %d ; V: %d"), static_cast<int>(HierarchicalVerbosity), static_cast<int>(verbosity));
 			return "";
 		}///Verbosity is too high, so we don't want to log
 
-		FString name = GetName();
-		//Global::Log(DATADEBUG, PURPOSE, "FContextData", callLocation, TEXT("Description of %s."), *name);
-		for (const TPair<ESubject, TScriptInterface<IDataMapInterface>>& subject : subjectMap.subjects)
-		{
-			//Global::Log(DATADEBUG, PURPOSE, "FContextData", callLocation, TEXT("Subject: %s Value: %s. FContextData::Description"), *UEnum::GetValueAsString(subject.Key), *subject.Value.GetObject()->GetName());
-			if (!subject.Value.GetObject())
-			{
-				/*Global::Log(DATADEBUG, PURPOSE, "FContextData", "Description", TEXT("Subject invalid! %s: Subject: %s. Actor: %s.")
-					, *name
-					, *Global::EnumValueOnly<ESubject>(subject.Key)
-					, IsValid(subject.Value.GetObject()) ? *subject.Value.GetObject()->GetName() : TEXT("Invalid")
-				);*/
-				name += LINE_TERMINATOR;
-				name += FString::Printf(TEXT("Subject invalid! Subject: %s. Actor: %s.")
-					, *Global::EnumValueOnly<ESubject>(subject.Key)
-					, IsValid(subject.Value.GetObject()) ? *subject.Value.GetObject()->GetName() : TEXT("Invalid")
-				);
-				continue;
-			}
-			for (const FDataMapEntry& dataChunk : subject.Value->DataMap())
-			{
-				/*Global::Log( DATADEBUG, PURPOSE, "FContextData", "Description", TEXT("%s: Subject: %s. Actor: %s. DataChunk: %s.")
-					, *name
-					, *Global::EnumValueOnly<ESubject>(subject.Key)
-					, IsValid(subject.Value.GetObject()) ?  *subject.Value.GetObject()->GetName() : TEXT("Invalid")
-					, IsValid(dataChunk.Chunk) ? *dataChunk.Chunk->Description() : TEXT("Invalid")
-				);	*/
-				name += LINE_TERMINATOR;
-				name += FString::Printf(TEXT("Subject: %s. Actor: %s. DataChunk: %s.")
-					, *Global::EnumValueOnly<ESubject>(subject.Key)
-					, IsValid(subject.Value.GetObject()) ? *subject.Value.GetObject()->GetName() : TEXT("Invalid")
-					, IsValid(dataChunk.Chunk) ? *dataChunk.Chunk->Description() : TEXT("Invalid")
-				);
-			}
-		}
-		name += LINE_TERMINATOR;/// So that the calling method is shown below rather than after last line
-
-		return *name;
+		return Description() + LINE_TERMINATOR;/// So that the calling method is shown below rather than after last line
 	}
 
 	///The name adjusted to represent the selected purpose
 	FString contextDataPurposeName = "contextData";
-
-private:
 
 #pragma endregion
 
 #pragma region Subjects
 public:
 
+	/// Game thread
 	TObjectPtr<UObject> Subject(ESubject inSubject) const
 	{
-		if (HasSubject(inSubject))
+		if (UObject* subject = subjectMap.Get(inSubject))
 		{
-			return subjectMap.subjects[inSubject].GetObject();
-		}
-		else
-		{
-			Global::Log(DATADEBUG, PURPOSE, "FContextData", "Subject", TEXT("Subject %s is not contained."), *Global::EnumValueOnly<ESubject>(inSubject));
+			return subject;
 		}
 
+		Global::Log(DATADEBUG, PURPOSE, "FContextData", "Subject", TEXT("Subject %s is not contained."), *Global::EnumValueOnly<ESubject>(inSubject));
 		return nullptr;
 	}
 
@@ -356,33 +282,36 @@ public:
 	}
 
 	///Returns the data map interface of a given subject
+	/// ESubject::Context is not an object, use contextData (or DataMapForSubject) for it
 	TScriptInterface<IDataMapInterface> DataMapInterfaceForSubject(ESubject inSubject) const
 	{
 		if (HasSubject(inSubject))
 		{
-			return subjectMap.subjects[inSubject];
-		}
-		else
-		{
-			Global::Log(DATADEBUG, PURPOSE, "FContextData", "DataMapInterfaceForSubject", TEXT("Subject %s is not contained or invalid."), *Global::EnumValueOnly<ESubject>(inSubject));
+			return subjectMap.Interface(inSubject);
 		}
 
+		Global::Log(DATADEBUG, PURPOSE, "FContextData", "DataMapInterfaceForSubject", TEXT("Subject %s is not contained or invalid."), *Global::EnumValueOnly<ESubject>(inSubject));
 		return nullptr;
+	}
+
+	/// Live DataMap of a subject, ESubject::Context included. Game thread
+	const FDataMap* DataMapForSubject(ESubject inSubject) const
+	{
+		if (inSubject == ESubject::Context) { return &contextData; }
+
+		TScriptInterface<IDataMapInterface> subject = DataMapInterfaceForSubject(inSubject);
+		return subject ? &subject->DataMap() : nullptr;
 	}
 
 	bool HasSubject(ESubject inSubject) const
 	{
-		return subjectMap.subjects.Contains(inSubject) && subjectMap.subjects[inSubject] && IsValid(subjectMap.subjects[inSubject].GetObject());
+		return subjectMap.Contains(inSubject);
 	}
 
-	bool HasData(ESubject inSubject, TSubclassOf<UDataChunk> inType) const
+	bool HasData(ESubject inSubject, FGameplayTag inKey) const
 	{
-		if (HasSubject(inSubject))
-		{
-			return DataMapInterfaceForSubject(inSubject)->HasData(inType);
-		}
-
-		return false;
+		const FDataMap* map = DataMapForSubject(inSubject);
+		return map && map->Has(inKey);
 	}
 
 	///Add a DataMapInterface object to a given subject
@@ -395,158 +324,89 @@ public:
 			return false;
 		}
 
-		if (HasSubject(inSubject))
+		if (HasSubject(inSubject) && !allowSwap)
 		{
-			if (allowSwap)
-			{
-				subjectMap.subjects[inSubject] = inDataObject;
-				return true;
-			}
-
 			return false;
 		}
-		else
-		{
-			subjectMap.subjects.Add(inSubject, inDataObject);
-			return true;
-		}
+
+		return subjectMap.Add(inSubject, inDataObject);
 	}
 
 	bool RemoveSubject(ESubject inSubject)
 	{
-		if (HasSubject(inSubject))
-		{
-			subjectMap.subjects.Remove(inSubject);
-			return true;
-		}
-		else { return true; }
+		subjectMap.subjects.Remove(inSubject);
+		return true;
 	}
 
-	template<class DataChunkClass>///<T> Must be a UDataChunk subclass
-	///Get DataChunk of T from ESubject
-	DataChunkClass* DataChunk(ESubject subject)
+	///Get DataChunk of T from ESubject. Game thread
+	///@return nullptr if the subject or chunk is missing (previously returned a NewObject)
+	template<class T = FDataChunk>
+	const T* DataChunk(ESubject inSubject, FGameplayTag inKey) const
 	{
-		if (DataChunkClass* dataChunk = DataMapInterfaceForSubject(subject)->DataChunk<DataChunkClass>())
-		{
-			return dataChunk;
-		}
-		else
-		{
-
-			Global::LogError(PURPOSE, "FContextData", "DataChunk", TEXT("Object of %s for subject %s is nullptr, returning empty new object. FContextData::DataChunk<T>(ESubject)"), *DataChunkClass::StaticClass()->GetName(), *UEnum::GetValueAsString(subject));
-			return NewObject<DataChunkClass>();
-		}
+		const FDataMap* map = DataMapForSubject(inSubject);
+		return map ? map->Find<T>(inKey) : nullptr;
 	}
 
-	///Get DataChunk from ESubject, TSubclassOf is used to find the datachunk in TMap
-	const TObjectPtr<UDataChunk> DataChunk(ESubject subject, TSubclassOf<UDataChunk> inType)
-	{
-		//If the data isn't contained, the value remains a 0
-		if (HasData(subject, inType))
-		{
-			return DataMapInterfaceForSubject(subject)->DataChunk(inType);
-		}
+	/// Apply one modifier to the live data of a subject (ESubject::Context included). Game thread
+	bool AdjustData(ESubject target, FGameplayTag inKey, const FDataModifier* modifier);
 
-		return nullptr;
-	}
-
-	bool AdjustData(ESubject target, const TObjectPtr<UDataChunk>& adjustmentChunk) const
-	{
-		if (adjustmentChunk)
-		{
-			if (HasSubject(target))
-			{
-				if (DataMapInterfaceForSubject(target)->HasData(adjustmentChunk->GetClass()))/// If we have the data already
-				{
-					Global::Log(DATATRIVIAL, PURPOSE, GetName(), "AdjustData", TEXT("Adjusting %s by enum value %d."), *adjustmentChunk->GetClass()->GetName(), (int)adjustmentChunk->DataModifier());
-					DataMapInterfaceForSubject(target)->DataChunk(adjustmentChunk->GetClass())->AdjustData(*adjustmentChunk);/// Adjust the data by the specified modifier
-				}
-				else/// Otherwise create the data chunk
-				{
-					Global::Log(DATATRIVIAL, PURPOSE, GetName(), "AdjustData", TEXT("Creating DataChunk %s with modification enum value %d."), *adjustmentChunk->GetClass()->GetName(), (int)adjustmentChunk->DataModifier());
-					DataMapInterfaceForSubject(target)->AddData(NewObject<UDataChunk>(Subject(target), adjustmentChunk->GetClass())->AdjustData(*adjustmentChunk));/// And still apply the modification requested
-				}
-				return true;
-			}
-			else if (target == ESubject::Context)/// As the subject map and context data are held separately, we have to have a separate case for when we try to adjust the Context subject
-			{
-				if (UDataMapGlobals::HasData(contextData, adjustmentChunk->GetClass()))
-				{
-					UDataMapGlobals::DataChunk(contextData, adjustmentChunk->GetClass())->AdjustData(*adjustmentChunk);/// Adjust the data by the specified modifier
-				}
-				else/// Otherwise create the data chunk
-				{
-					Global::LogError(PURPOSE, GetName(), "AdjustData", TEXT("Cannot create DataChunk %s with modification enum value %d for the context as we have no outer!"), *adjustmentChunk->GetClass()->GetName(), (int)adjustmentChunk->DataModifier());
-					//DataMapInterfaceForSubject(target)->AddData(NewObject<UDataChunk>(Get, adjustmentChunk->GetClass())->AdjustData(adjustmentChunk->DataModifier()));/// And still apply the modification requested
-				}
-				return true;
-			}
-		}
-
-		Global::LogError(PURPOSE, GetName(), "AdjustData", TEXT("DataAdjustment for %s and subject %s %s")
-			, *GetName()
-			, *Global::EnumValueOnly<ESubject>(target)
-			, HasSubject(target) ? TEXT("has an invalid DataAdjustment chunk!") : TEXT("does not contain subject!")
-		);
-		
-		return false;
-	}
-
-	/// Will perform Purpose's DataAdjustements as appropriate
+	/// Will perform Purpose's DataAdjustements as appropriate. Game thread
 	/// @param inEventTypeToAdjust: Determines what data can be adjusted based on selection made in Asset
 	/// @param inLogCat: Allows us to clarify where adjustment is coming from in fail case
 	/// @param callingMethodName: Allows us to clarify where adjustment is coming from in fail case
-	/// @param source: Allows us to clarify where adjustment is coming from in fail case
-	/// @param sourceName: Allows us to clarify where adjustment is coming from in fail case
-	void AdjustDataIfPossible(const TArray<FPurposeModificationEntry>& dataAdjustments, EPurposeSelectionEvent inEventTypeToAdjust, const FLogCategoryBase& inLogCat, FString callingMethodName, TObjectPtr<UObject> source = nullptr, FString sourceName = "") const
-	{
-		for (const FPurposeModificationEntry& chunk : dataAdjustments)/// For every piece of data we want to adjust based on the selected purpose
-		{
-			if (IsValid(chunk.dataAdjustment) && chunk.selectionEvent == inEventTypeToAdjust)
-			{
-				AdjustData(chunk.subjectToAdjust, chunk.dataAdjustment.Get());
-			}
-			else
-			{
-				/// Only log if the DataAdjustment was invalid
-				if (!IsValid(chunk.dataAdjustment))
-				{
-					source ?
-						Global::LogError(inLogCat, *source, callingMethodName, TEXT("DataAdjustment for %s has an invalid DataAdjustment chunk!"), *GetName())
-						: Global::LogError(inLogCat, sourceName, callingMethodName, TEXT("DataAdjustment for %s has an invalid DataAdjustment chunk!"), *GetName());
-				}
-			}
-		}
-	}
+	void AdjustDataIfPossible(EPurposeSelectionEvent inEventTypeToAdjust, const FLogCategoryBase& inLogCat, FString callingMethodName);
 
 #pragma endregion
-
-public:
-	//FORCEINLINE bool operator ==(const FContextData& other) const
-	//{
-	//	return addressOfPurpose == other.addressOfPurpose && uniqueIdentifier == other.uniqueIdentifier;
-	//}
 };
-/*
-FORCEINLINE uint32 GetTypeHash(const FContextData& b)
-{
-	return FCrc::MemCrc32(&b, sizeof(FContextData));
-}*/
 
-USTRUCT(BlueprintType)
+/// Everything the evaluation thread knows about one candidate, copied on the game thread when the occurrence is raised
+/// The worker never touches the candidate's component: identity is compared with TObjectKey, data comes from the snapshot
+struct AO_API FCandidateSnapshot
+{
+	/// Only handed back to the game thread with the selected purpose, never dereferenced by the worker
+	TWeakObjectPtr<UPurposeAbilityComponent> component;
+	TObjectKey<UObject> componentKey;
+
+	/// The candidate's data with its current behavior's context data appended (ESubject::Candidate)
+	FDataMap data;
+
+	/// cachedScoreOfPurpose of the current behavior, the score a new purpose must beat
+	float currentScore = 0.0f;
+
+	/// For "already performing this purpose" checks
+	TObjectKey<UObject> currentEventTarget;
+	const UObject* currentBehaviorAbility = nullptr;/// Identity only, never dereferenced
+
+	FString debugName;
+};
+
+/// <summary>
+/// An occurrence queued to an evaluation thread
+/// Built on the game thread (PurposeSystem::Occurrence), so every DataMap here is a snapshot the game thread can no longer change
+/// </summary>
+///Design: Purpose Performance Snapshot; Every occurrence snapshots every candidate (a copy of each DataMap)
+/// If that shows up in profiling, components can cache an immutable TSharedRef<const FDataMap> snapshot rebuilt only when OnDataMapChanged fires
+/// (plus once per frame for world-derived chunks), so occurrences share one copy per candidate instead of making their own
 struct AO_API FOccurrence
 {
-	GENERATED_BODY()
-public:
+	/// These are all the candidates we wish to evaluate for a new purpose against the provided context
+	TArray<FCandidateSnapshot> candidates;
 
-	/// These are all the candidates we wish to evaluate for a new purpose against tthe provided context
-	TArray<TObjectPtr<UPurposeAbilityComponent>> candidatesForNewPurpose;
+	/// Live subjects, only used to build the FContextData handed back to the game thread
+	FSubjectMap subjectMap;
 
-	/// Subject map for the potential purposes to evaluate against
-	FSubjectMap subjectMapForPotentialPurposes;
+	/// Live (unresolved) copy of the context data, handed back with the selected purpose
+	FDataMap contextData;
 
-	/// Context data for the potential purposes to evaluate against
-	TArray<FDataMapEntry> ContextDataForPotentialPurposes;
+	/// What conditions read for every subject except Candidate. ESubject::Context is included
+	TMap<ESubject, FDataMap> subjectSnapshots;
+
+	TObjectKey<UObject> instigatorKey;
+	TObjectKey<UObject> eventTargetKey;
+	FString instigatorName;
+
+	/// FPlatformTime::Seconds() when the snapshot was taken. Compared at evaluation to measure how old the data is
+	double snapshotTimeSeconds = 0.0;
 };
 
 ///Umbrella type for multiple queues of UContextData_Deprecated
@@ -575,7 +435,7 @@ public:
 
 	}
 
-	///Controls while loop execution of Run() 
+	///Controls while loop execution of Run()
 	bool stopThread = true;
 
 	///Essentially the speed that the background thread will call Run(); thanks to FPlatformMisc::Sleep()
@@ -594,15 +454,10 @@ public:
 	///Runs Recursively to evaluate queues until thread is told to stop and/or shutdown
 	uint32 Run() override;
 
-	//void AddCandidatesToThreadCache(TArray<TObjectPtr<UPurposeAbilityComponent>> inCandidates)
-	//{
-	//	candidateCache.Append(inCandidates);
-	//}
-
 	///@return bool: True when the purpose was stored to a queue to be evaluated at some point
-	bool QueuePurpose(FOccurrence potentialPurposesToQueue)
+	bool QueuePurpose(FOccurrence&& potentialPurposesToQueue)
 	{
-		if(potentialPurposeQueue.Enqueue(potentialPurposesToQueue))
+		if(potentialPurposeQueue.Enqueue(MoveTemp(potentialPurposesToQueue)))
 		{
 			/// Since TQueue doesn't have a .Num()
 			numQueueItems++;/// ensure this thread has an increased number of queue items
@@ -627,13 +482,17 @@ public:
 	}
 
 	/// @param purposeToEvaluate; The combination of context, subjects and potential purposes to evaluate to a single purpose for a unique subject. After evaluation, the data may be copied to further the purpose system, but this struct will be destroyed regardless.
-	///@return bool: 
-	bool SelectPurposeIfPossible(FOccurrence& purposeToEvaluate);
+	///@return bool:
+	bool SelectPurposeIfPossible(const FOccurrence& purposeToEvaluate);
 
 	const TArray<FPurpose>& GetPurposeCacheForBackgroundThread() const { return purposeCacheForBackgroundThread; }
 	const TArray<TObjectPtr<UPurposeAbilityComponent>>& GetCandidateCache() const { return candidateCache; }
 
 	const int GetNumQueuedPurposes() { return numQueueItems; }
+
+	/// Oldest snapshot seen at evaluation, in seconds. For the data age test (see AO.Purpose.SnapshotAgeWarningSeconds)
+	double GetMaxSnapshotAgeSeconds() const { return maxSnapshotAgeSeconds; }
+
 protected:
 	const TArray<FPurpose>& purposeCacheForBackgroundThread;
 
@@ -643,7 +502,9 @@ protected:
 
 	/// TQueues do not have a .Num() to track how many queued items
 	/// We can track the number of queued items so that if we want to have multiple threads we can simply compare queue to the thread with less items
-	int numQueueItems = 0;
+	std::atomic<int32> numQueueItems = 0;
+
+	double maxSnapshotAgeSeconds = 0.0;
 
 	bool CreateAsyncTask_PurposeSelected(FContextData context);
 
@@ -651,168 +512,18 @@ protected:
 
 namespace PurposeSystem
 {
+	/// Game thread. Snapshots the subjects, context and candidates, then queues the occurrence to the least busy thread
+	/// Candidates are the thread's candidate cache
+	AO_API bool Occurrence(const FSubjectMap& subjectsOfContext, const FDataMap& context, const TArray<FPurposeEvaluationThread*>& backgroundThreads);
 
-	static bool QueuePurposeToBackgroundThread(FOccurrence potentialPurposes, FPurposeEvaluationThread& backgroundThread)
-	{
-		if (backgroundThread.QueuePurpose(potentialPurposes))
-		{
-			return true;
-		}
-		/// If the potential purposes were not queued they will simply be GCd;
-		return false;
-	}
-
-	static bool Occurrence(FSubjectMap subjectsOfContext, TArray<FDataMapEntry> context, const TArray<FPurposeEvaluationThread*>& backgroundThreads)
-	{
-		FPurposeEvaluationThread* selectedThread = nullptr;
-		int leastNumQueuedPurposes = 0; 
-		for (FPurposeEvaluationThread* thread : backgroundThreads)
-		{
-			if (!thread)
-			{
-				continue;
-			}
-			if (thread->GetPurposeCacheForBackgroundThread().Num() < 1)
-			{
-				Global::Log(DATADEBUGTRIVIAL, EVENT, "PurposeSystem", "Occurrence", TEXT("No Purposes stored on background thread!"));
-				continue;
-			}
-
-			if (thread->GetCandidateCache().Num() < 1 && !subjectsOfContext.subjects.Contains(ESubject::Candidate))
-			{
-				Global::Log(DATADEBUGTRIVIAL, EVENT, "PurposeSystem", "Occurrence", TEXT("No candidates for Occurrence!"));
-				continue;
-			}
-			
-			if(leastNumQueuedPurposes==0) 
-			{
-				leastNumQueuedPurposes = thread->GetNumQueuedPurposes();
-				selectedThread = thread;
-				continue;
-			}
-			
-			if (thread->GetNumQueuedPurposes() <= leastNumQueuedPurposes)
-			{
-				leastNumQueuedPurposes = thread->GetNumQueuedPurposes();
-				selectedThread = thread;
-			}
-		}
-
-		if (!selectedThread)
-		{
-			Global::Log(DATADEBUG, EVENT, "PurposeSystem", "Occurrence", TEXT("Selected background thread is invalid!!"));
-			return false;
-		}
-
-		FPurposeEvaluationThread& backgroundThread = *selectedThread;
-
-		FOccurrence occurrenceData;
-
-		occurrenceData.candidatesForNewPurpose = backgroundThread.GetCandidateCache();
-
-		occurrenceData.subjectMapForPotentialPurposes = subjectsOfContext;
-		occurrenceData.ContextDataForPotentialPurposes = context;
-
-		FString instigatorName = occurrenceData.subjectMapForPotentialPurposes.subjects.Contains(ESubject::Instigator) ? *occurrenceData.subjectMapForPotentialPurposes.subjects[ESubject::Instigator].GetObject()->GetPathName(occurrenceData.subjectMapForPotentialPurposes.subjects[ESubject::Instigator].GetObject()->GetOuter()) : TEXT("No Instigator");
-		Global::Log(DATADEBUGTRIVIAL, LogOccurrence, "PurposeSystem", "Occurrence", TEXT("Ocurrence caused by %s"), *instigatorName);
-
-		/// Queue the subjects, context, and potential purposes to background thread
-		/// At this time, we don't bother with UniqueSubjects for Occurrences, as Conditions for Events are revolving strictly around the context of the Occurrence
-		return PurposeSystem::QueuePurposeToBackgroundThread(occurrenceData, backgroundThread);
-	}
-	
-	static bool Occurrence(const TArray<TObjectPtr<UPurposeAbilityComponent>>& inCandidates, FSubjectMap subjectsOfContext, TArray<FDataMapEntry> context, const TArray<FPurposeEvaluationThread*>& backgroundThreads)
-	{
-		FPurposeEvaluationThread* selectedThread = nullptr;
-		int leastNumQueuedPurposes = 0;
-		for (FPurposeEvaluationThread* thread : backgroundThreads)
-		{
-			if (!thread)
-			{
-				continue;
-			}
-			if (thread->GetPurposeCacheForBackgroundThread().Num() < 1)
-			{
-				Global::LogError(EVENT, "PurposeSystem", "Occurrence", TEXT("No Event Assets stored on background thread!"));
-				continue;
-			}
-
-			if (thread->GetCandidateCache().Num() < 1)
-			{
-				Global::LogError(EVENT, "PurposeSystem", "Occurrence", TEXT("No Candidates stored on background thread!"));
-				continue;
-			}
-
-			if(leastNumQueuedPurposes==0) 
-			{
-				leastNumQueuedPurposes = thread->GetNumQueuedPurposes();
-				selectedThread = thread;
-				continue;
-			}
-			
-			if (thread->GetNumQueuedPurposes() <= leastNumQueuedPurposes)
-			{
-				leastNumQueuedPurposes = thread->GetNumQueuedPurposes();
-				selectedThread = thread;
-			}
-		}
-
-		if (!selectedThread)
-		{
-			Global::Log(DATADEBUG, EVENT, "PurposeSystem", "Occurrence", TEXT("No valid background thread was selected!"));
-			return false;
-		}
-
-		FPurposeEvaluationThread& backgroundThread = *selectedThread;
-
-		FOccurrence potentialPurposes;
-
-		potentialPurposes.candidatesForNewPurpose = inCandidates;
-
-		potentialPurposes.subjectMapForPotentialPurposes = subjectsOfContext;
-		potentialPurposes.ContextDataForPotentialPurposes = context;
-
-		/// Queue the subjects, context, and potential purposes to background thread
-		/// At this time, we don't bother with UniqueSubjects for Occurrences, as Conditions for Events are revolving strictly around the context of the Occurrence
-		return PurposeSystem::QueuePurposeToBackgroundThread(potentialPurposes, backgroundThread);
-	}
-
-	namespace Private
-	{
-		bool AttemptToPassSelectedPurposeToOwner(const FContextData& selectedPurpose);
-	}
+	/// Game thread. As above, with explicit candidates
+	AO_API bool Occurrence(const TArray<TObjectPtr<UPurposeAbilityComponent>>& inCandidates, const FSubjectMap& subjectsOfContext, const FDataMap& context, const TArray<FPurposeEvaluationThread*>& backgroundThreads);
 
 	/// The background thread has found a purpose
 	/// It then calls this from an AsyncTask, which executes on the game thread
 	/// It requests the owner of the purpose store the purpose
-	/// Then it attempts to get the next layer of purpose
-	static void PurposeSelected(FContextData contextOfSelectedPurpose)
-	{
-		if (!contextOfSelectedPurpose.purposeOwner.IsValid())
-		{
-			Global::LogError(EVENT, "PurposeSystem", "PurposeSelected", TEXT("Provided an invalid PurposeOwner!"));
-			return;
-		}
-
-		/// Refactor: Purpose Evaluation; We can't call back to purpose ability component from here
-			/// So how can we get the context back to the purpose component?
-				/// Easiest solution is to just move this to the cpp, but that's sloppy design
-				/// We need a way to call an occurrence on ability start, and a way to return a purpose to the ability component
-		bool purposeAccepted = PurposeSystem::Private::AttemptToPassSelectedPurposeToOwner(contextOfSelectedPurpose);
-
-		if (!purposeAccepted)
-		{
-			Global::Log(DATADEBUG, PURPOSE, "PurposeSystem", "PurposeSelected", TEXT("Purpose Owner %s did not accept the provided purpose: %s!")
-				, *contextOfSelectedPurpose.GetOwnerName()
-				, *contextOfSelectedPurpose.GetName()
-			);
-
-			return;
-		}
-
-		contextOfSelectedPurpose.AdjustDataIfPossible(contextOfSelectedPurpose.purpose.DataAdjustments(), EPurposeSelectionEvent::OnSelected, PURPOSE, "PurposeSelected", nullptr, "PurposeSystem");
-	}
-
+	/// Then performs the purpose's OnSelected data adjustments
+	AO_API void PurposeSelected(FContextData contextOfSelectedPurpose);
 }
 
 #pragma endregion
@@ -888,8 +599,6 @@ public:
 
 	void DoTask(ENamedThreads::Type CurrentThread, const FGraphEventRef& MyCompletionGraphEvent)
 	{
-		//		//Global::Log(EHierarchicalCalltraceVerbosity::DEBUG, "FAsyncGraphTask_PurposeSelected", "DoTask", TEXT(""));
-
 		shouldAbandon ? Cancel() : PurposeSelected();
 	}
 
@@ -902,10 +611,8 @@ public:
 protected:
 	void Cancel()
 	{
-		//Global::Log(EHierarchicalCalltraceVerbosity::DEBUG, "FAsyncGraphTask_PurposeSelected", "Cancel", TEXT(""));
 	}
 
 };
 
 #pragma endregion
-

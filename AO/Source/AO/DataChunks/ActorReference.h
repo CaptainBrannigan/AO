@@ -3,81 +3,84 @@
 #pragma once
 
 #include "Data/Data.h"
+#include "Data/DataTags.h"
 #include "GameFramework/Actor.h"
 #include "Data/GlobalLog.h"
 #include "ActorReference.generated.h"
 
-UCLASS(MinimalAPI)
+USTRUCT(BlueprintType, meta = (DisplayName = "Actor Reference"))
 /// <summary>
 /// Direct reference to a vessel actor
+/// The reference is weak: a chunk never keeps an actor alive
+///
+/// Threading: the actor is only dereferenced on the game thread (GetActor)
+/// On a snapshot, validity is baked in by ResolveForSnapshot, so HasValue never touches GUObjectArray on the evaluation thread
+/// Comparing two references (IsSameActor) only compares index + serial number, which is safe anywhere
 /// </summary>
-class UActorReference : public UDataChunk
+struct AO_API FActorReferenceChunk : public FDataChunk
 {
 	GENERATED_BODY()
-public:
 
-	UActorReference() {}
+	FActorReferenceChunk() : FDataChunk(TAG_Data_Actor) {}
+	FActorReferenceChunk(FGameplayTag inKey, AActor* inActor) : FDataChunk(inKey), actor(inActor) {}
 
-	/// While it can not be overloaded, this method will provide datachunks the opportunity to access their outer object and potentially initialize themselves from there
-	UDataChunk& NonOverloadInitialize() final;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Data")
+	TWeakObjectPtr<AActor> actor = nullptr;
 
-	///Overload this to require new object arguments
-	UActorReference& Initialize()
-	{
-		return *this;
-	}	
-	
-	UActorReference& Initialize(TObjectPtr<AActor> inActor)
-	{
-		actor = inActor;
-		return *this;
-	}
+	UPROPERTY(EditAnywhere, Category = "Data")
+	/// If set, the actor is filled in with the owner of the DataMap when it is initialized (replaces NonOverloadInitialize)
+	bool bBindToOwner = false;
 
 	///Important for use with DataMapInterface HasData() in determining if a DataChunk can be accessed
-	///Override this with determination of whether a value has been set for this chunk or not
-	bool HasValue() final
+	bool HasValue() const override
 	{
-		return IsValid(actor);
+		return bResolved ? bResolvedValid : actor.IsValid();
 	}
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite)
-	/// If valid, will return actor->GetActorLocation.MakeRelative(actorRelativeLocation)
-	TObjectPtr<AActor> actor = nullptr;
-
-	const TObjectPtr<AActor> Value() const
+	void ResolveForSnapshot() override
 	{
-		return actor;
+		bResolved = true;
+		const AActor* liveActor = actor.Get();
+		bResolvedValid = liveActor != nullptr;
+		resolvedClass = liveActor ? liveActor->GetClass() : nullptr;
 	}
 
-	void SetValue(TObjectPtr<AActor> inActor)
+	/// Snapshot only: the actor's class as of the snapshot, nullptr if unresolved or invalid
+	/// Classes don't change during play, so comparing or IsChildOf on this is safe on the evaluation thread
+	const UClass* ResolvedClass() const { return bResolved ? resolvedClass.Get() : nullptr; }
+
+	void InitializeForOwner(AActor* inAvatar, UAbilitySystemComponent* inAbilitySystem) override
 	{
-		actor = inActor;
+		if (bBindToOwner && inAvatar) { actor = inAvatar; }
 	}
 
-	void CopyDataFrom(TObjectPtr<UDataChunk> ChunkToCopyFrom) override
+	/// Game thread only
+	AActor* GetActor() const
 	{
-		if (!ChunkToCopyFrom)
-		{
-			Global::LogError(LogData, "UVectorChunk", "CopyDataFrom", TEXT("Incoming chunk invalid!"));
-			return;
-		}
-
-		if (!ChunkToCopyFrom->IsA<UActorReference>())
-		{
-			Global::LogError(LogData, "UVectorChunk", "CopyDataFrom", TEXT("Incoming chunk not a vector chunk!"));
-			return;
-		}
-
-		SetValue(Cast<UActorReference>(ChunkToCopyFrom)->Value());
+		ensureMsgf(IsInGameThread(), TEXT("FActorReferenceChunk::GetActor called off the game thread, use HasValue/IsSameActor on the evaluation thread"));
+		return actor.Get();
 	}
 
-	///Override this to provide more detailed information about a data chunk
-	///Call Super::Description() to include string about EDataType
-	FString Description() const final
+	void SetValue(AActor* inActor) { actor = inActor; }
+
+	/// Safe on any thread, never dereferences
+	bool IsSameActor(const FActorReferenceChunk& other) const { return actor.HasSameIndexAndSerialNumber(other.actor); }
+
+	bool CopyValueFrom(const FInstancedStruct& source) override;
+
+	FString Description() const override
 	{
-		return Super::Description() + TEXT("Actor: ") + (IsValid(actor) ? *actor->GetName() : TEXT("Invalid"));
+		return FDataChunk::Description() + TEXT("Actor: ") + (IsInGameThread() && actor.IsValid() ? actor->GetName() : FString(bResolved ? (bResolvedValid ? TEXT("Valid") : TEXT("Invalid")) : TEXT("Unresolved")));
 	}
 
-	///If implicit conversion is desired
-	//operator insertdatatype() { return instertvaluemember; }
+protected:
+
+	UPROPERTY(Transient, NotReplicated)
+	bool bResolved = false;
+
+	UPROPERTY(Transient, NotReplicated)
+	bool bResolvedValid = false;
+
+	UPROPERTY(Transient, NotReplicated)
+	TObjectPtr<UClass> resolvedClass = nullptr;
 };

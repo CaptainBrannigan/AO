@@ -4,6 +4,8 @@
 
 #include "CoreMinimal.h"
 #include "Data/Data.h"
+#include "Data/DataMapInterface.h"
+#include "Data/DataTags.h"
 #include "GameplayTagContainer.h"
 #include "NativeGameplayTags.h"
 #include "Data/GlobalLog.h"
@@ -17,54 +19,31 @@ enum class EBehaviorTagModifier : uint8
 	, RemoveTag
 };
 
-/**
- *
- */
-UCLASS(Abstract)
-class UContextualTags : public UDataChunk
+USTRUCT(BlueprintType, meta = (DisplayName = "Contextual Tags"))
+/// <summary>
+/// A set of gameplay tags describing a subject or context
+/// </summary>
+///Design: GAS GameplayTags OwnedTags; When the subject has an ASC, its owned tags (GetOwnedGameplayTags) are the same idea and are already replicated
+/// A chunk that copies the ASC's owned tags at snapshot (ResolveForSnapshot, like FAttributeChunk) would let Condition_ContextualTags query GAS state directly
+struct AO_API FContextualTagsChunk : public FDataChunk
 {
 	GENERATED_BODY()
-public:
 
-	///Overload this to require new object arguments
-	UContextualTags& Initialize()
-	{
-		Global::Log(DATATRIVIAL, PURPOSE, "ULyraBlacboardData", "Initialize", TEXT(""));
-
-		return *this;
-	}
+	FContextualTagsChunk() {}
+	explicit FContextualTagsChunk(FGameplayTag inKey) : FDataChunk(inKey) {}
 
 	///Important for use with DataMapInterface HasData() in determining if a DataChunk can be accessed
-	///Override this with determination of whether a value has been set for this chunk or not
-	virtual bool HasValue()
+	bool HasValue() const override
 	{
 		return true;
 	}
 
-	UPROPERTY(EditAnywhere)
-		FGameplayTagContainer tags;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Data")
+	FGameplayTagContainer tags;
 
-	///Value is used solely for a consistent name for getting a datachunk's value
-	///Because derivatives hold different data types, from primitive to custom, it cannot be virtual
 	const FGameplayTagContainer& Value() const { return tags; };
 
-	/// Override this method so that datachunks specified in a purpose asset may be modified when purpose is selected
-	/// @param modificationContext: What purpose selection event will lead to this data modification
-	/// @param inModifier: The encapsulated modifier specified on the derived DataChunks class
-	TObjectPtr<UDataChunk> AdjustData(const UDataChunk& inModifier) final;
-
-	/// Override in subclasses so they may return the correct enum representing modification logic
-	const uint8 DataModifier() final { return static_cast<uint8>(modifier); }
-
-	///Override this to provide more detailed information about a data chunk
-	///Call Super::Description() to include string about EDataType
-	virtual FString Description() const
-	{
-		return TEXT("Type: ") + GetClass()->GetName() + TEXT(" ");
-	}
-
-	UFUNCTION(BlueprintCallable)
-		void AddToValue(FGameplayTag inTag)
+	void AddToValue(FGameplayTag inTag)
 	{
 		if (!tags.HasTagExact(inTag))
 		{
@@ -72,8 +51,7 @@ public:
 		}
 	}
 
-	UFUNCTION(BlueprintCallable)
-	void RemoveFromVallue(FGameplayTag inTag)
+	void RemoveFromValue(FGameplayTag inTag)
 	{
 		if (tags.HasTagExact(inTag))
 		{
@@ -81,17 +59,49 @@ public:
 		}
 	}
 
-	///If implicit conversion is desired
-	//operator insertdatatype() { return instertvaluemember; }
-protected:
+	bool CopyValueFrom(const FInstancedStruct& source) override
+	{
+		if (const FContextualTagsChunk* tagSource = source.GetPtr<FContextualTagsChunk>())
+		{
+			tags = tagSource->tags;
+			return true;
+		}
+		return false;
+	}
 
-	UPROPERTY(EditAnywhere, Category = "Data Adjustment")
-		/// Set on a purpose asset in the DataAdjustment array
-		/// Not otherwise relevant
-		EBehaviorTagModifier modifier = EBehaviorTagModifier::None;
-
-	UPROPERTY(EditAnywhere, Category = "Data Adjustment")
-		/// Tag we are either adding or removing
-		FGameplayTag tagForAdjustment;
+	FString Description() const override
+	{
+		return FDataChunk::Description() + tags.ToStringSimple();
+	}
 };
 
+USTRUCT(BlueprintType, meta = (DisplayName = "Behavior Tags"))
+/// Tags describing the current behavior (Data.BehaviorTags), added to the context data by UAI_SequentialActions
+/// (Was UBehaviorTags in AI_SequentialActions.h)
+struct AO_API FBehaviorTagsChunk : public FContextualTagsChunk
+{
+	GENERATED_BODY()
+
+	FBehaviorTagsChunk() : FContextualTagsChunk(TAG_Data_BehaviorTags) {}
+};
+
+USTRUCT(BlueprintType, meta = (DisplayName = "Contextual Tags"))
+/// Adds or removes a tag. Creates an FContextualTagsChunk under the key if the subject doesn't have one
+struct AO_API FContextualTagsModifier : public FDataModifier
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, Category = "Data Adjustment")
+	EBehaviorTagModifier modifier = EBehaviorTagModifier::None;
+
+	UPROPERTY(EditAnywhere, Category = "Data Adjustment")
+	/// Tag we are either adding or removing
+	FGameplayTag tagForAdjustment;
+
+	bool Apply(FDataMap& map, FGameplayTag key) const override;
+
+	FString Description() const override
+	{
+		return Global::EnumValueOnly<EBehaviorTagModifier>(modifier) + TEXT(" ") + tagForAdjustment.ToString();
+	}
+};

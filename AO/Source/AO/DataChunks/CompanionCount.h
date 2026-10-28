@@ -3,15 +3,16 @@
 #pragma once
 
 #include "Purpose/DataChunks/FloatChunk.h"
+#include "Data/DataTags.h"
 #include "CompanionCount.generated.h"
 
-UCLASS(MinimalAPI)
+USTRUCT(BlueprintType, meta = (DisplayName = "Companion Count"))
 /// <summary>
-/// 
+/// A named float: selecting this type fills in its key (Data.CompanionCount)
 /// </summary>
-class UCompanionCount : public UFloatChunk
+struct AO_API FCompanionCountChunk : public FFloatChunk
 {
 	GENERATED_BODY()
-public:
 
+	FCompanionCountChunk() : FFloatChunk(TAG_Data_CompanionCount) {}
 };

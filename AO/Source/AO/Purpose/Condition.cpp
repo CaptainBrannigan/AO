@@ -17,9 +17,3 @@ UCondition::UCondition()
 	responseCurve->FloatCurve.SetKeyTime(key, 1.0f);
 	responseCurve->FloatCurve.SetKeyInterpMode(key, RCIM_Linear);*/
 }
-
-float UCondition::EvaluateConditionInternal_Implementation(const UDataChunk* primaryDataChunk, const UDataChunk* secondaryDataChunk, class UPurposeAbilityComponent* owner) const
-{
-	Global::LogError(LogCondition, GetName(), "EvaluatConditionInternal_Implementation", TEXT("This is never supposed to be called!"));
-	return 0.0f;
-}

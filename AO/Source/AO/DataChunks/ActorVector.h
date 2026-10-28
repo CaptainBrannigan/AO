@@ -4,48 +4,89 @@
 
 #include "CoreMinimal.h"
 #include "Purpose/DataChunks/Vector.h"
-#include "Purpose/PurposeAbilityComponent.h"
+#include "GameFramework/Actor.h"
 #include "ActorVector.generated.h"
 
-/**
- * 
- */
-UCLASS(Abstract)
-class AO_API UActorVector : public UVectorChunk
+USTRUCT(BlueprintType, meta = (DisplayName = "Actor Vector"))
+/// <summary>
+/// A vector read from an actor when one is set, otherwise the stored vector
+/// On the game thread GetValue reads the actor live. On a snapshot (evaluation thread) it returns the value copied by ResolveForSnapshot
+/// Derived chunks change what is read from the actor by overriding ReadFromActor (location, velocity, forward vector...)
+/// </summary>
+struct AO_API FActorVectorChunk : public FVectorChunk
 {
 	GENERATED_BODY()
-public:
 
-	/// While it can not be overloaded, this method will provide datachunks the opportunity to access their outer object and potentially initialize themselves from there
-	UDataChunk& NonOverloadInitialize() final
-	{
-		if (GetOuter() && GetOuter()->IsA<UPurposeAbilityComponent>())
-		{
-			Global::Log(DATATRIVIAL, LogData, "UActorReference", "NonOverloadInitialize", TEXT("Was able to initialize actor with avatar actor of outer."));
-			actorForLocation = Cast<UPurposeAbilityComponent>(GetOuter())->GetAvatarActor();
-		}
-		return *this;
-	}
+	FActorVectorChunk() {}
+	explicit FActorVectorChunk(FGameplayTag inKey) : FVectorChunk(inKey) {}
 
 	///Important for use with DataMapInterface HasData() in determining if a DataChunk can be accessed
-	///Override this with determination of whether a value has been set for this chunk or not
-	bool HasValue() override { return IsValid(actorForLocation) || Super::HasValue(); }
+	bool HasValue() const override { return HasActor() || FVectorChunk::HasValue(); }
 
-	///Value is used solely for a consistent name for getting a datachunk's value
-	///Because derivatives hold different data types, from primitive to custom, it cannot be virtual
-	const FVector Value() const override { return actorForLocation ? actorForLocation->GetActorLocation() : Super::Value(); }
-	TObjectPtr<AActor> ActorValue() const { return actorForLocation; }
-
-	void SetValueWithActor(TObjectPtr<AActor> inActorForLocation) 
-	{ 
-		actorForLocation = inActorForLocation; 
-		if (actorForLocation) { location = actorForLocation->GetActorLocation(); }
+	FVector GetValue() const override
+	{
+		if (!bResolved && IsInGameThread())
+		{
+			if (const AActor* liveActor = actor.Get()) { return ReadFromActor(*liveActor); }
+		}
+		return value;
 	}
 
-	void CopyDataFrom(TObjectPtr<UDataChunk> ChunkToCopyFrom) override;
+	void ResolveForSnapshot() override
+	{
+		bResolved = true;
+		bResolvedActorValid = false;
+		if (const AActor* liveActor = actor.Get())
+		{
+			bResolvedActorValid = true;
+			value = ReadFromActor(*liveActor);
+		}
+	}
+
+	void InitializeForOwner(AActor* inAvatar, UAbilitySystemComponent* inAbilitySystem) override
+	{
+		if (bBindToOwner && inAvatar) { actor = inAvatar; }
+	}
+
+	/// Game thread only
+	AActor* GetActor() const
+	{
+		ensureMsgf(IsInGameThread(), TEXT("FActorVectorChunk::GetActor called off the game thread!"));
+		return actor.Get();
+	}
+
+	/// Whether an actor is set, safe on any thread for a snapshot
+	bool HasActor() const { return bResolved ? bResolvedActorValid : actor.IsValid(); }
+
+	void SetValueWithActor(AActor* inActor)
+	{
+		actor = inActor;
+		if (inActor) { value = ReadFromActor(*inActor); }
+	}
+
+	/// Accepts actor references (takes the actor), other actor vectors (takes actor and value) and plain vectors (takes the value, clears the actor)
+	bool CopyValueFrom(const FInstancedStruct& source) override;
+
+	FString Description() const override
+	{
+		return FVectorChunk::Description() + (HasActor() ? TEXT(" (from actor)") : TEXT(""));
+	}
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Data")
+	TWeakObjectPtr<AActor> actor = nullptr;
+
+	UPROPERTY(EditAnywhere, Category = "Data")
+	/// If set, the actor is filled in with the owner of the DataMap when it is initialized (replaces NonOverloadInitialize)
+	bool bBindToOwner = false;
 
 protected:
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite)
-	TObjectPtr<AActor> actorForLocation;
+	/// Game thread only. What this chunk reads from its actor
+	virtual FVector ReadFromActor(const AActor& inActor) const { return inActor.GetActorLocation(); }
+
+	UPROPERTY(Transient, NotReplicated)
+	bool bResolved = false;
+
+	UPROPERTY(Transient, NotReplicated)
+	bool bResolvedActorValid = false;
 };

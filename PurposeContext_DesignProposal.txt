@@ -1,0 +1,237 @@
+SUBJECTS AND CONTEXT: A MORE READABLE FRAMEWORK
+================================================
+
+A proposal, not implemented. The struct DataChunk conversion is already in the code; this file is about what
+sits around it: ESubject, FSubjectMap, FContextData, FOccurrence and how data reaches a condition.
+Each section gives what's there now, what's awkward about it, and the proposal.
+
+
+------------------------------------------------------------------------------
+0. THE SHORT VERSION
+------------------------------------------------------------------------------
+
+The system has three kinds of data, but today they share two containers and a lot of special cases:
+
+    What it is                          Lives for                   Today                                   Proposed name
+    ----------------------------------  --------------------------  --------------------------------------  ------------------
+    Who an actor is / their state       The actor's lifetime        UPurposeAbilityComponent::data          Actor data
+    What an AI is doing right now       The running behavior        FContextData::contextData (+ tasks)     Behavior data
+    What just happened                  One occurrence (immutable)  FContextData::contextData (again)       Event data
+
+Proposal, in order of value:
+  1. Split FContextData into an immutable event (FOccurrenceEvent) and a running behavior (FActiveBehavior).
+  2. Make "where does this data come from" explicit with one address type, FDataAddress { Subject, Scope, Key },
+     used by conditions, modifiers and task hand-offs instead of four different (ESubject, key) pairs.
+  3. Name subjects with gameplay tags (Subject.Instigator, Subject.Target, Subject.Squad...) so new roles don't need code.
+  4. Describe "how a behavior raises an occurrence" as data (event tag + subject mapping) instead of code in ActionPerformed.
+  5. Line the event up with GAS's FGameplayEventData, so occurrences, ability triggers and cues share one path.
+
+Each step stands alone; 1 and 2 are the readability wins, 3-5 are the versatility wins.
+
+
+------------------------------------------------------------------------------
+1. ONE STRUCT DOING THREE JOBS: FContextData
+------------------------------------------------------------------------------
+
+NOW
+    FContextData is:
+      - the result of purpose selection (purpose, score, owner), sent from the worker
+      - the AI's running behavior (stored on the component as currentBehaviorForOwner, mutated by tasks)
+      - the occurrence's context (contextData is ESubject::Context during evaluation)
+
+    So "contextData.contextData" exists, the same struct is copied, mutated and compared in different places,
+    and it carries a full FPurpose copy (condition array, modifier array) everywhere it goes.
+
+PROPOSED
+    // What happened. Built once on the game thread, never changed. Cheap to share (TSharedRef<const FOccurrenceEvent>)
+    struct FOccurrenceEvent
+    {
+        FGameplayTag            EventTag;           // Event.Combat.WeaponFired, Event.Activity.Patrol
+        FSubjectMap             Subjects;           // weak, game thread only
+        FDataMap                EventData;          // payload: time of occurrence, sound type, last known position...
+        double                  SnapshotTime;
+    };
+
+    // The result the worker sends back. Small: an index/pointer to the purpose, not a copy
+    struct FPurposeSelection
+    {
+        TWeakObjectPtr<UPurposeAbilityComponent> Candidate;
+        const UEventAsset*      Purpose;            // purposes are assets, so a pointer is their identity
+        float                   Score;
+        TSharedRef<const FOccurrenceEvent> Event;
+    };
+
+    // What the AI is doing. Owned by the component, the only one of the three that is mutable
+    struct FActiveBehavior
+    {
+        const UEventAsset*      Purpose;
+        FGameplayAbilitySpecHandle Ability;         // instead of swapping purpose.behaviorAbility to the instance
+        FSubjectMap             Subjects;           // copied from the event, can be re-targeted while running
+        FDataMap                BehaviorData;       // task outputs, behavior tags, things the behavior learns
+        float                   Score;
+        TSharedRef<const FOccurrenceEvent> Cause;   // the event that started it, for "react to the same thing" checks
+    };
+
+    What this fixes:
+      - "Is this the same purpose I'm already doing" becomes Purpose == Purpose && Target == Target.
+        Today it compares the asset's behaviorAbility with the duplicated instance PerformAbility stores,
+        so the check in ProvidePurposeToOwner and on the worker can never match (left as-is in the conversion).
+      - OnSelected modifiers apply to FActiveBehavior::BehaviorData, never to a temporary copy.
+      - Purpose copies per selection go away (the Todo in SelectPurposeIfPossible).
+
+
+------------------------------------------------------------------------------
+2. WHERE DATA COMES FROM: FDataAddress
+------------------------------------------------------------------------------
+
+NOW
+    Four places say "a chunk on a subject", each slightly differently:
+      UCondition                   primarySubjectType + primaryKey, secondarySubjectType + secondaryKey (+ fallback rules)
+      FPurposeModificationEntry    subjectToAdjust + dataKey
+      FContextAdjustmentFromAction subjectToAdjust + dataKey
+      FTaskAndDataPair             subjectToRetrieveFrom + dataToRetrieve (and the task's own map for dataToModify)
+
+    And two rules are implicit:
+      - ESubject::Context is not an object, so every one of the four special-cases it.
+      - A subject's data silently includes its running behavior's data (appended at snapshot, subject wins on collisions).
+        A condition can't say "the target's current goal" vs "the target's location" except by key naming.
+
+PROPOSED
+    UENUM() enum class EDataScope : uint8
+    {
+        Actor,      // the subject's own data (component, spawner, activity)
+        Behavior,   // the subject's running behavior data (only purpose components have one)
+        Any,        // Actor, then Behavior: today's implicit rule, kept as the default for compatibility
+    };
+
+    USTRUCT()
+    struct FDataAddress
+    {
+        UPROPERTY(EditAnywhere, meta = (Categories = "Subject"))  FGameplayTag Subject;   // Subject.Target
+        UPROPERTY(EditAnywhere)                                  EDataScope   Scope = EDataScope::Any;
+        UPROPERTY(EditAnywhere, meta = (Categories = "Data"))     FGameplayTag Key;       // Data.Location
+    };
+
+    // The event is just another subject (Subject.Event), so "Context" stops being a special case:
+    //   FDataAddress{ Subject.Event, Actor, Data.Time.Occurrence }
+
+    UCondition         { FDataAddress Primary; FDataAddress Secondary; }   // fallback rules become explicit fields
+    FDataModification  { FDataAddress Target; TInstancedStruct<FDataModifier> Modifier; }   // shared by purposes and actions
+    FTaskAndDataPair   { FDataAddress Source; FGameplayTag TaskKey; }
+
+    One resolver, one place for the rules:
+      const FDataMapEntry* FSubjectDataView::Resolve(const FDataAddress&) const;      // worker, snapshots
+      FDataMap* FActiveBehavior::ResolveMutable(const FDataAddress&);                 // game thread, live
+
+    A details-panel customization can print an address as "Target.Behavior.Data.Location", which reads like a sentence
+    in the purpose asset instead of three separate dropdowns.
+
+
+------------------------------------------------------------------------------
+3. SUBJECTS AS TAGS
+------------------------------------------------------------------------------
+
+NOW
+    ESubject { None, Instigator, EventTarget, PreviousEventTarget, Context, Candidate }
+    PreviousEventTarget exists because SeekNewBehavior needs "who I was dealing with" without it being a fresh event.
+    Every new role (squad leader, objective, last known threat, ally under fire) is a code change + recompile.
+
+PROPOSED
+    Native tags for the roles the code relies on:
+        Subject.Self        (the candidate; "Self" reads better than Candidate inside a condition)
+        Subject.Instigator
+        Subject.Target
+        Subject.Event       (the occurrence's own data, replaces Context)
+    Designer tags for everything else, no code:
+        Subject.Squad.Leader, Subject.Objective, Subject.LastKnownThreat, Subject.Previous.Target ...
+
+    FSubjectDataView becomes a small TArray<TPair<FGameplayTag, const FDataMap*>> (5-8 entries, linear scan),
+    so the evaluation cost is the same as the enum array. Conditions get a tag picker limited to Subject.*.
+
+    Cost: an extra indirection for the four native roles, and existing assets' ESubject values need a one-time fixup
+    (a CoreRedirect can't map enum -> tag, so a small editor utility or PostLoad conversion).
+
+
+------------------------------------------------------------------------------
+4. RAISING OCCURRENCES AS DATA
+------------------------------------------------------------------------------
+
+NOW (UPurposeAbilityComponent::ActionPerformed, SeekNewBehavior)
+    subjectMap = CurrentBehavior().subjectMap;
+    subjectMap.Add(Instigator, this);
+    subjectMap.Add(EventTarget, CurrentBehavior().Subject(Instigator));   // who caused my behavior is now my target
+    contextData = CurrentBehavior().contextData;
+    contextData.Set(FTimeOfOccurrenceChunk());
+    The remapping is the same for every ability, and lives in C++.
+
+PROPOSED
+    USTRUCT() struct FSubjectMapping { FGameplayTag From; FGameplayTag To; };   // behavior subject -> event subject
+
+    USTRUCT() struct FOccurrenceTemplate
+    {
+        UPROPERTY(EditAnywhere) FGameplayTag EventTag;                // Event.Combat.Engaging
+        UPROPERTY(EditAnywhere) TArray<FSubjectMapping> Subjects;     // Self -> Instigator, Instigator -> Target
+        UPROPERTY(EditAnywhere) TArray<FDataAddress> CopyToEvent;     // which behavior data travels with the event
+    };
+
+    Default template on the component reproduces today's behavior; a behavior or an individual sequence action can
+    override it (an "investigate" action raises Event.Search with the last known position, a "fire" action raises
+    Event.Combat.Fired with the target). SeekNewBehavior becomes a template too (Target -> Subject.Previous.Target).
+
+    Purposes can then gate on EventTag before scoring any condition: a combat reaction purpose lists
+    RequiredEventTags = Event.Combat, and the worker skips it for patrol events. That's the cheapest filter available,
+    and today every purpose is scored against every event.
+
+
+------------------------------------------------------------------------------
+5. LINING UP WITH GAS
+------------------------------------------------------------------------------
+
+    FGameplayEventData already has: EventTag, Instigator, Target, OptionalObject, InstigatorTags, TargetTags,
+    EventMagnitude, ContextHandle, TargetData. FOccurrenceEvent is that plus an FDataMap payload and the snapshot time.
+
+    So:
+      - ASC::HandleGameplayEvent(EventTag, Payload) can be the single entry point that raises occurrences, so player
+        input, ability activation, damage and AI actions all produce events the same way.
+      - Abilities with AbilityTriggers on the same EventTag still fire directly (reflexes that skip scoring).
+      - InstigatorTags/TargetTags are the subjects' owned tags at event time, a free snapshot of GAS state
+        that conditions can query (roles, Committed/Alarmed states, behavior ActivationOwnedTags).
+      - GameplayCues can listen to the same event tags for audio/VFX feedback of AI decisions in debug builds.
+
+    Attributes slot in through FAttributeChunk (already in the code): Subject.Target + Data.Morale reads the target's
+    Morale attribute at snapshot, so conditions don't care whether a float is a chunk or an attribute.
+
+
+------------------------------------------------------------------------------
+6. WHAT IT LOOKS LIKE TO A DESIGNER
+------------------------------------------------------------------------------
+
+    Purpose "Suppress engaged target"
+      Required event tags:   Event.Combat
+      Conditions:
+        Float           Self.Actor.Data.Morale                 range 30-100
+        Distance        Self.Actor.Data.Location  vs  Target.Actor.Data.Location     range 5-40m
+        History         Target.Any.Data.ContextualHistory      tag Contextual.Combat.Engaged.*   time since < 10s
+      On selected:
+        Tags            Self.Behavior.Data.BehaviorTags        add Behavior.Suppressing
+        History         Target.Actor.Data.ContextualHistory    Engaged (stacking)
+      Behavior:         AI_SequentialActions ...
+        Action "Move to cover"
+          MoveTo.Goal  <-  Self.Behavior.Data.Task.EQS.Result
+          Raises       Event.Combat.Moving   (Self -> Instigator, Target -> Target)
+
+    Today the same purpose needs the reader to know that Context is special, that Target's data silently includes its
+    behavior's, and that the occurrence a MoveTo raises is decided in ActionPerformed.
+
+
+------------------------------------------------------------------------------
+7. SUGGESTED ORDER
+------------------------------------------------------------------------------
+
+    1. FActiveBehavior / FOccurrenceEvent / FPurposeSelection split   (code only, no asset changes)
+    2. FDataAddress with Scope = Any default                          (asset fields change: ESubject + key -> address)
+    3. Event tags on occurrences + RequiredEventTags on purposes      (biggest evaluation-cost win)
+    4. Subjects as tags                                               (asset fixup needed, do it while assets are few)
+    5. Occurrence templates, then HandleGameplayEvent as the entry point
+
+    Since AO/Content has no purpose assets yet, steps 2 and 4 are cheapest now.

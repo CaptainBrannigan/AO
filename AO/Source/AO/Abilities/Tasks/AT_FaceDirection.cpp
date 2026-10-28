@@ -31,9 +31,10 @@ void UAT_FaceDirection::Activate()
 		taskFinished.Broadcast();
 	}
 
-	targetActorCache = DataChunk<ULocationToFace>()->ActorValue();
+	const FActorVectorChunk* locationToFace = DataChunk<FActorVectorChunk>(TAG_Data_Task_FaceDirection_Location);
+	targetActorCache = locationToFace ? locationToFace->GetActor() : nullptr;
 
-	rotationToFaceLocation = (DataChunk<ULocationToFace>()->Value() - pawnCache->GetActorLocation()).GetSafeNormal().Rotation();
+	rotationToFaceLocation = ((locationToFace ? locationToFace->GetValue() : pawnCache->GetActorLocation() + pawnCache->GetActorForwardVector()) - pawnCache->GetActorLocation()).GetSafeNormal().Rotation();
 
 	//actorCache->SetFocalPoint(DataChunk<ULocationToFace>()->Value());
 

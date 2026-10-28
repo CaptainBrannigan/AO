@@ -28,10 +28,10 @@ UE_DEFINE_GAMEPLAY_TAG(TAG_Moving, "Moving");
 UAT_MoveTo::UAT_MoveTo(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
 {
-	AddData(CreateDefaultSubobject<UMovementSpeed>("MovementSpeedForMoveTo"));
-	AddData(CreateDefaultSubobject<UMoveGoal>("GoalLocation"));
-	AddData(CreateDefaultSubobject<UPathLength>("LengthOfMovementPath"));
-	AddData(CreateDefaultSubobject<UTimeLengthOfMovement>("TimeLengthOfMoveTo"));
+	dataMap.Set(FFloatChunk(TAG_Data_Task_MoveTo_Speed));
+	dataMap.Set(FActorVectorChunk(TAG_Data_Task_MoveTo_Goal));
+	dataMap.Set(FFloatChunk(TAG_Data_Task_MoveTo_PathLength));
+	dataMap.Set(FFloatChunk(TAG_Data_Task_MoveTo_Duration));
 
 	contextualTagForTask.AddTag(TAG_Moving);
 }
@@ -127,7 +127,8 @@ bool UAT_MoveTo::PreActivationInitialization(const FActionSequenceEntry& entryDa
 	//	}
 	//}
 
-	FVector location = DataChunk<UMoveGoal>()->Value();
+	const FActorVectorChunk* moveGoal = DataChunk<FActorVectorChunk>(TAG_Data_Task_MoveTo_Goal);
+	FVector location = moveGoal ? moveGoal->GetValue() : FVector::ZeroVector;
 	if (!location.ContainsNaN() || location != FVector::ZeroVector)
 	{
 		MoveReq.SetGoalLocation(location);
@@ -163,11 +164,12 @@ bool UAT_MoveTo::PreActivationInitialization(const FActionSequenceEntry& entryDa
 		MoveReq.SetNavigationFilter(OwnerController->GetDefaultNavigationFilterClass());
 		if (UCharacterMovementComponent* moveComp = OwnerController->GetPawn()->FindComponentByClass<UCharacterMovementComponent>())
 		{
-			if (HasData(UMovementSpeed::StaticClass()))
+			const FFloatChunk* moveSpeed = DataChunk<FFloatChunk>(TAG_Data_Task_MoveTo_Speed);
+			if (moveSpeed)
 			{
 				Global::Log(DATATRIVIAL, BEHAVIOR, "UAT_MoveTo", "PreActivationInitialization", TEXT("Move Speed Original: %f. MinAnalogSpeed: %f."), moveComp->MaxWalkSpeed, moveComp->MinAnalogWalkSpeed);
-				moveComp->MaxWalkSpeed = DataChunk<UMovementSpeed>()->Value() * 100;/// Have to compensate for uu, data is set as human readable m/s
-				moveComp->MinAnalogWalkSpeed = DataChunk<UMovementSpeed>()->Value() * 10;/// Have to compensate for uu, data is set as human readable m/s
+				moveComp->MaxWalkSpeed = moveSpeed->GetValue() * 100;/// Have to compensate for uu, data is set as human readable m/s
+				moveComp->MinAnalogWalkSpeed = moveSpeed->GetValue() * 10;/// Have to compensate for uu, data is set as human readable m/s
 				/// Min Analog WalkSpeed will prevent speeds lower than 2 m/s by default
 				Global::Log(DATATRIVIAL, BEHAVIOR, "UAT_MoveTo", "PreActivationInitialization", TEXT("Move Speed Updated: %f. MinAnalogSpeed: %f."), moveComp->MaxWalkSpeed, moveComp->MinAnalogWalkSpeed);
 			}
@@ -192,9 +194,10 @@ bool UAT_MoveTo::PreActivationInitialization(const FActionSequenceEntry& entryDa
 	vessel = source.Vessel();
 
 	/// Check to see if we have a tag that indicates a found position, and modify that tag to indicate we are moving to that position
-	if (vessel && vessel->HasData(UContextualHistory::StaticClass()))
+	///Design: GAS LooseTags Position Moving; Seeking/Moving/AtLocation is current state, which fits ASC loose tags (AddLooseGameplayTag/RemoveLooseGameplayTag)
+	/// or the task ability's ActivationOwnedTags, which GAS removes automatically when the ability ends. History keeps only the timestamps
+	if (FContextualHistoryChunk* contextualTagData = vessel ? vessel->EditData<FContextualHistoryChunk>(TAG_Data_ContextualHistory) : nullptr)
 	{
-		TObjectPtr<UContextualHistory> contextualTagData = vessel->DataChunk<UContextualHistory>();
 
 		TArray<FContextHistoryEntry>& tagsContainer = contextualTagData->contextualHistory;
 
@@ -244,9 +247,8 @@ void UAT_MoveTo::MoveSuccessful()
 {
 	Global::Log(FULLTRACE, TASK, "UAT_MoveTo", "MoveSuccessful", TEXT(""));
 	/// Since movement was successful, add the positional tags that were originally indicated to move to
-	if (vessel && vessel->HasData(UContextualHistory::StaticClass()))
+	if (FContextualHistoryChunk* contextualTagData = vessel ? vessel->EditData<FContextualHistoryChunk>(TAG_Data_ContextualHistory) : nullptr)
 	{
-		TObjectPtr<UContextualHistory> contextualTagData = vessel->DataChunk<UContextualHistory>();
 
 		for (int i = 0; i < finishedTagCache.Num(); ++i)
 		{

@@ -6,27 +6,31 @@
 #include "GameplayTagAssetInterface.h"
 #include "Data/GlobalLog.h"
 
-//UE_DEFINE_GAMEPLAY_TAG(TAG_InputTag_Primary_Grip, "InputTag.Primary.Grip");
-
-TObjectPtr<UDataChunk> UContextualTags::AdjustData(const UDataChunk& inModifier)
+bool FContextualTagsModifier::Apply(FDataMap& map, FGameplayTag key) const
 {
-	if (!inModifier.IsA<UContextualTags>())
+	if (modifier == EBehaviorTagModifier::None || !tagForAdjustment.IsValid())
 	{
-		Global::Log(DATADEBUG, LogData, "UContextualTags", "AdjustData", TEXT("Provided a non-ContextualTags modifier chunk."));
-		return this;
+		Global::Log(DATADEBUG, LogData, "FContextualTagsModifier", "Apply", TEXT("Modifier for %s has no modification or tag set."), *key.ToString());
+		return false;
 	}
 
-	EBehaviorTagModifier dataModifier = Cast<UContextualTags>(&inModifier)->modifier;
+	FContextualTagsChunk* chunk = map.FindOrAdd<FContextualTagsChunk>(key);
+	if (!chunk)
+	{
+		return false;
+	}
 
-	switch (dataModifier)
+	switch (modifier)
 	{
 		case EBehaviorTagModifier::AddTag:
-			tags.AddTag(Cast<UContextualTags>(&inModifier)->tagForAdjustment);
+			chunk->AddToValue(tagForAdjustment);
 			break;
 		case EBehaviorTagModifier::RemoveTag:
-			tags.RemoveTag(Cast<UContextualTags>(&inModifier)->tagForAdjustment);
+			chunk->RemoveFromValue(tagForAdjustment);
 			break;
+		default:
+			return false;
 	}
 
-	return this;
+	return true;
 }

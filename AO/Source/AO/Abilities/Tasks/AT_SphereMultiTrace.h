@@ -78,19 +78,14 @@ protected:
 	FSequenceTaskFinished taskFinished;
 
 	///Allows evaluations to retrieve chunks of data from any type of object implementing interface
-	const TArray<FDataMapEntry>& DataMap() final { return dataMap; }
-	TArray<FDataMapEntry> DataMapCopy() final { return dataMap; }
+	const FDataMap& DataMap() const final { return dataMap; }
 
-	void AddData(UDataChunk* inData, bool overwriteValue = true) final { AddDataLocal(*inData); }
-	void AppendData(const TArray<FDataMapEntry>& inDataMap, bool overwriteValue = true) final { AppendDataLocal(inDataMap); }
-	void RemoveData(TSubclassOf<UDataChunk> inClass) final { RemoveDataLocal(inClass); }
 
 	UPROPERTY(EditAnywhere)
-		TArray<FDataMapEntry> dataMap;
+		FDataMap dataMap;
 
 	/// Force implementers to provide an editable datamap
-	/// The only way to the change the DataMap is through the Server RPCs
-	TArray<FDataMapEntry>& DataMapInternal() final { return dataMap; }
+	FDataMap& MutableDataMap() final { return dataMap; }
 
 	TWeakObjectPtr<UObject> contextObj;
 	FVector startPos;

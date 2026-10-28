@@ -1,40 +1,31 @@
 #pragma once
 
 #include "Data/Data.h"
+#include "Data/GlobalLog.h"
 #include "Enum.generated.h"
 
-UCLASS(Abstract)
+USTRUCT(BlueprintType, meta = (Hidden))
 /// <summary>
-/// Base class for FVector type data
+/// Base type for enum data, so one condition (Condition_Enum) can compare any enum chunk
 /// </summary>
-class AO_API UEnumChunk : public UDataChunk
+struct AO_API FEnumChunk : public FDataChunk
 {
 	GENERATED_BODY()
-public:
 
-	UEnumChunk() {}
-
-	///Overload this to require new object arguments
-	UEnumChunk& Initialize() { return *this; }
+	FEnumChunk() {}
+	explicit FEnumChunk(FGameplayTag inKey) : FDataChunk(inKey) {}
 
 	///Important for use with DataMapInterface HasData() in determining if a DataChunk can be accessed
-	///Override this with determination of whether a value has been set for this chunk or not
-	bool HasValue() final
+	bool HasValue() const override { return GetEnumValue() != 0; }/// Every enum in the system reserves 0 for None
+
+	virtual uint8 GetEnumValue() const { return 0; }
+
+	/// So conditions can show and compare by name
+	virtual const UEnum* GetEnumType() const { return nullptr; }
+
+	FString Description() const override
 	{
-		return true;
+		const UEnum* enumType = GetEnumType();
+		return FDataChunk::Description() + TEXT("Value: ") + (enumType ? enumType->GetNameStringByValue(GetEnumValue()) : FString::FromInt(GetEnumValue()));
 	}
-
-	///Value is used solely for a consistent name for getting a datachunk's value
-	///Because derivatives hold different data types, from primitive to custom, it cannot be virtual
-	virtual const uint8 Value() const PURE_VIRTUAL(UEnumChunk::Value, return uint8(););
-
-	///Override this to provide more detailed information about a data chunk
-	///Call Super::Description() to include string about EDataType
-	virtual FString Description() const
-	{
-		return TEXT("Type: ") + GetClass()->GetName() + TEXT(" ");
-	}
-
-	///If implicit conversion is desired
-	//operator insertdatatype() { return instertvaluemember; }
 };

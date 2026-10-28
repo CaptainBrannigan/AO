@@ -2,14 +2,22 @@
 
 
 #include "ActorReference.h"
-#include "Purpose/PurposeAbilityComponent.h"
+#include "ActorVector.h"
 
-UDataChunk& UActorReference::NonOverloadInitialize()
+bool FActorReferenceChunk::CopyValueFrom(const FInstancedStruct& source)
 {
-	if (GetOuter() && GetOuter()->IsA<UPurposeAbilityComponent>())
+	if (const FActorReferenceChunk* referenceSource = source.GetPtr<FActorReferenceChunk>())
 	{
-		Global::Log(DATATRIVIAL, LogData, "UActorReference", "NonOverloadInitialize", TEXT("Was able to initialize actor with avatar actor of outer."));
-		actor = Cast<UPurposeAbilityComponent>(GetOuter())->GetAvatarActor();
+		actor = referenceSource->actor;
+		return true;
 	}
-	return *this;
+
+	if (const FActorVectorChunk* actorVectorSource = source.GetPtr<FActorVectorChunk>())
+	{
+		actor = actorVectorSource->actor;
+		return true;
+	}
+
+	Global::LogError(LogData, "FActorReferenceChunk", "CopyValueFrom", TEXT("Incoming chunk %s has no actor!"), source.GetScriptStruct() ? *source.GetScriptStruct()->GetName() : TEXT("Invalid"));
+	return false;
 }

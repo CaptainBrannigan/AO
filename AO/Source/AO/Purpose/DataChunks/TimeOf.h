@@ -3,6 +3,8 @@
 #pragma once
 
 #include "Data/Data.h"
+#include "Data/DataMapInterface.h"
+#include "Data/DataTags.h"
 #include "Misc/TimeSpan.h"
 #include "Data/GlobalLog.h"
 #include "TimeOf.generated.h"
@@ -14,99 +16,83 @@ enum class ETimeOfModifier : uint8
 	, UpdateTimeToNow
 };
 
-UCLASS(Abstract)
+USTRUCT(BlueprintType, meta = (DisplayName = "Time"))
 /// <summary>
+/// A point in time. Defaults to the time the chunk was created
 /// </summary>
-class AO_API UTimeOf : public UDataChunk
+struct AO_API FTimeChunk : public FDataChunk
 {
 	GENERATED_BODY()
-public:
 
-	UTimeOf() 
-	{
-		value = FDateTime::UtcNow();
-	}
-
+	FTimeChunk() : value(FDateTime::UtcNow()) {}
+	explicit FTimeChunk(FGameplayTag inKey) : FDataChunk(inKey), value(FDateTime::UtcNow()) {}
 
 	///Important for use with DataMapInterface HasData() in determining if a DataChunk can be accessed
-	///Override this with determination of whether a value has been set for this chunk or not
-	bool HasValue() final
+	bool HasValue() const override
 	{
 		return true;/// Value can never be a nullptr, so always return true to allow evaluation
 	}
 
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Data")
 	FDateTime value;
 
-	const FDateTime Value() const
+	FDateTime Value() const
 	{
 		return value;
 	}
 
-	virtual void CopyDataFrom(TObjectPtr<UDataChunk> ChunkToCopyFrom) override
+	bool CopyValueFrom(const FInstancedStruct& source) override
 	{
-		if (ChunkToCopyFrom && ChunkToCopyFrom->IsA<UTimeOf>())
+		if (const FTimeChunk* timeSource = source.GetPtr<FTimeChunk>())
 		{
-			Global::Log(DATATRIVIAL, BEHAVIOR, GetName(), "CopyDataFrom", TEXT("Copying value %s from %s!"), *Cast<UTimeOf>(ChunkToCopyFrom)->value.ToString(), *ChunkToCopyFrom->GetName());
-			value = Cast<UTimeOf>(ChunkToCopyFrom)->value;
+			value = timeSource->value;
+			return true;
 		}
-		else
-		{
-			Global::Log(DATATRIVIAL, PURPOSE, "UTimeOf", "CopyDataFrom", TEXT("Chunk %s is either invalid or not a float chunk!"), ChunkToCopyFrom ? *ChunkToCopyFrom->GetName() : TEXT(""));
-		}
+		return false;
 	}
 
-	///Override this to provide more detailed information about a data chunk
-	///Call Super::Description() to include string about EDataType
-	FString Description() const final
+	FString Description() const override
 	{
-		return Super::Description() + FString::Printf(TEXT("Value: %s"), *value.ToString());
+		return FDataChunk::Description() + FString::Printf(TEXT("Value: %s"), *value.ToString());
 	}
-
-	///If implicit conversion is desired
-	//operator insertdatatype() { return instertvaluemember; }
-
-#pragma region DataAdjustment
-public:
-
-	/// Override this method so that datachunks specified in a purpose asset may be modified when purpose is selected
-	TObjectPtr<UDataChunk> AdjustData(const UDataChunk& inModifier) final
-	{
-		if (!inModifier.IsA<UTimeOf>())
-		{
-			Global::Log(DATADEBUG, LogData, "UTimeOf", "AdjustData", TEXT("Provided a non-ContextualTags modifier chunk."));
-			return this;
-		}
-
-		ETimeOfModifier modifier = Cast<UTimeOf>(&inModifier)->dataModifier;
-		switch (modifier)
-		{
-			case ETimeOfModifier::UpdateTimeToNow: value = FDateTime::UtcNow(); break;
-			default:
-				break;
-		}
-		Global::Log(DATATRIVIAL, PURPOSE, *this, "AdjustData", TEXT("Adjusted by %s. Value: %s."), *Global::EnumValueOnly<ETimeOfModifier>(modifier), *Value().ToString());
-
-		return this;
-	}
-
-	/// Override in subclasses so they may return the correct enum representing modification logic
-	const uint8 DataModifier() override { return static_cast<uint8>(dataModifier); }
-
-protected:
-
-	UPROPERTY(EditAnywhere)
-		/// Set on a purpose asset in the DataAdjustment array
-		/// Not otherwise relevant
-		ETimeOfModifier dataModifier = ETimeOfModifier::UpdateTimeToNow;
-
-#pragma endregion
 };
 
-
-UCLASS()
-/// <summary>
-/// </summary>
-class AO_API UTimeOfOccurrence : public UTimeOf
+USTRUCT(BlueprintType, meta = (DisplayName = "Time Of Occurrence"))
+/// When an occurrence was raised (Data.Time.Occurrence)
+struct AO_API FTimeOfOccurrenceChunk : public FTimeChunk
 {
 	GENERATED_BODY()
+
+	FTimeOfOccurrenceChunk() : FTimeChunk(TAG_Data_Time_Occurrence) {}
+};
+
+USTRUCT(BlueprintType, meta = (DisplayName = "Time"))
+/// Sets a time chunk to now. Creates an FTimeChunk under the key if the subject doesn't have one
+struct AO_API FTimeModifier : public FDataModifier
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, Category = "Data Adjustment")
+	ETimeOfModifier dataModifier = ETimeOfModifier::UpdateTimeToNow;
+
+	bool Apply(FDataMap& map, FGameplayTag key) const override
+	{
+		FTimeChunk* chunk = map.FindOrAdd<FTimeChunk>(key);
+		if (!chunk)
+		{
+			return false;
+		}
+
+		switch (dataModifier)
+		{
+			case ETimeOfModifier::UpdateTimeToNow: chunk->value = FDateTime::UtcNow(); break;
+			default:
+				return false;
+		}
+		Global::Log(DATATRIVIAL, PURPOSE, "FTimeModifier", "Apply", TEXT("Adjusted %s by %s. Value: %s."), *key.ToString(), *Global::EnumValueOnly<ETimeOfModifier>(dataModifier), *chunk->Value().ToString());
+
+		return true;
+	}
+
+	FString Description() const override { return Global::EnumValueOnly<ETimeOfModifier>(dataModifier); }
 };
