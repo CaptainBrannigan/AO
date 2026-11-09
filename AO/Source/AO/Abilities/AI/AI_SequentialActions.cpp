@@ -69,6 +69,9 @@ void UAI_SequentialActions::AttemptSequenceOfActions()
 
 		UGameplayTask* taskDuplicate = NewAbilityTask(taskEntry.task);
 		
+		///Bug: AI Tasks Resources Behavior; The entry's resource is only claimed here, never required
+		/// UGameplayTasksComponent::UpdateTaskActivations only blocks a task when its required resources overlap, so this task still activates while another holds the same resource
+		/// Behavior layers need each task to both require and claim. Two tasks in one action sharing a resource would then stop overlapping, so existing behaviors need checking
 		taskDuplicate->AddClaimedResource(taskEntry.requiredResource);
 		taskDuplicatesForCurrentAction.Add(taskDuplicate);/// the task now has required resources
 		/// The index of the cached duplicate and the original entry are identical, so when we go to perform data adjustments we just use the same index

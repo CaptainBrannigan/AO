@@ -593,6 +593,9 @@ bool FPurposeEvaluationThread::SelectPurposeIfPossible(const FOccurrence& occurr
 			if (!highScorePurpose->behaviorAbility) {
 				continue; }/// If the behavior is invalid, we shouldn't be receiving calls to this
 
+			/// Refactor: Identical Behaviors Time-Gated Occurrences; This skip intentionally ignores the occurrence's instigator, since conditions couldn't yet tell "cover from P" apart from "cover from Q"
+				/// So a second shooter hitting the same target with the same winning behavior is skipped rather than starting a new behavior against the new instigator
+				/// With the cover conditions this can be told apart: compare intent + reference instead, and remove this skip when identical behaviors and time-gated occurrences are refactored
 			if (occurrenceToEvaluate.eventTargetKey != TObjectKey<UObject>() && occurrenceToEvaluate.eventTargetKey == candidate.currentEventTarget /// If the target
 				&& highScorePurpose->behaviorAbility.Get() == candidate.currentBehaviorAbility)/// And the ability are both the same
 				///Then we don't want to restart behavior, and we don't want it passed back to the Game Thread at all
