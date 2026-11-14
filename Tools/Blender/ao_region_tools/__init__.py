@@ -30,6 +30,13 @@ ENUMS = {
                      ("normal", "Normal Map", "Integrated tangent-space normal map")],
     "convention": [("0.2", "Step 0.2 (6 regions)", "Material multiplier 5"),
                    ("0.125", "Step 0.125 (9 regions)", "Material multiplier 8")],
+    "method": [("subdivide", "Subdivide", "Refine the whole mesh where boundaries and folds need it"),
+               ("targeted", "Targeted", "Keep the base mesh; inject detail islands only where color borders and folds need them")],
+    "targeted_area": [("auto", "Automatic", "Base faces crossed by color borders, plus fold faces per Targeted depth scope"),
+                      ("selection", "Selection", "Only the source mesh's selected faces")],
+    "targeted_depth_scope": [("everywhere", "Everywhere", "Faces needing fold depth become islands too"),
+                             ("color_areas", "Color areas", "Height detail only inside color islands"),
+                             ("none", "None", "No height detail in islands")],
     "normal_green": [("directx", "DirectX (UE)", "Green points down"),
                      ("opengl", "OpenGL (Blender)", "Green points up")],
 }
@@ -149,6 +156,15 @@ def to_object_mode(context):
         bpy.ops.object.mode_set(mode="OBJECT")
 
 
+def texture_mismatch(obj, image_name):
+    """The images the object's materials use, when the chosen texture isn't one of them (else an empty list).
+    Catches a Texture field left over from another object: the regions would follow the wrong texture."""
+    if not image_name or obj is None or obj.type != "MESH":
+        return []
+    used = core.material_image_names(obj)
+    return used if used and image_name not in used else []
+
+
 def set_status(context, state, text):
     """Status line under Generate Regions (window-manager data: not saved with the file)."""
     wm = context.window_manager
@@ -220,10 +236,82 @@ class AO_REGIONS_OT_generate(bpy.types.Operator):
         context.view_layer.objects.active = obj
         if has_groups(obj):
             refresh_groups(obj, s.group_prefix)
-        set_status(context, "DONE", "Done: %s\n%d groups, %d tris, %.0fs" % (
-            obj.name, len(report["groups"]), report["triangles_after"], report["seconds"]))
+        done = "Done: %s\n%d groups, %d tris, %.0fs" % (
+            obj.name, len(report["groups"]), report["triangles_after"], report["seconds"])
+        used = texture_mismatch(src, s.image_name)
+        if used:
+            done += "\nTexture isn't on this object's material"
+            self.report({"WARNING"}, "Texture %s isn't used by %s's material (it uses %s)" % (
+                s.image_name, src.name, ", ".join(used[:2])))
+        set_status(context, "DONE", done)
         self.report({"INFO"}, "%s: %d groups, %d -> %d triangles in %.1fs (details in the RegionReport text)" % (
             obj.name, len(report["groups"]), report["triangles_before"], report["triangles_after"], report["seconds"]))
+        return {"FINISHED"}
+
+
+# Presets: each sets only the settings that define its case. ("size", f) values are world distances given as a
+# fraction of the active object's largest dimension, so they fit models of any scale (skipped with no active object).
+# Never touched: texture, UV map, convention, analysis size, triangle target, method, groups/IDs.
+PRESET_KEEP = ("image_name", "uv_layer")            # kept by the Defaults preset
+PRESETS = {
+    "CLOTH": ("Cloth with creases", "Tones of one color fold into Shade; painted creases become depth", {
+        "region_count": 0, "merge_distance": 0.06, "lightness_weight": 0.2, "shade_group_distance": 0.035,
+        "color_tolerance": 0.1, "darker_tolerance_stops": 5.0, "lighter_tolerance_stops": 1.0,
+        "majority_radius": 1, "majority_iterations": 2, "min_region_area": 0.0005,
+        "shade_range": 0.94, "dissolve_unneeded": False,
+        "max_subdiv_levels": 6, "depth_subdiv_levels": 2,
+        "depth_source": "luminance", "depth_curve": 1.0, "depth_blur_px": 1,
+        "depth_strength": ("size", 0.0077), "depth_max": ("size", 0.0082), "depth_subdiv_threshold": ("size", 0.000123),
+    }),
+    "CAMO": ("Camo (tones are regions)", "Three regions split by brightness; no tone folding, no depth", {
+        "region_count": 3, "lightness_weight": 1.0, "shade_group_distance": 0.0, "region_merge_distance": 0.0,
+        "color_tolerance": 0.0, "darker_tolerance_stops": 0.0, "lighter_tolerance_stops": 0.0,
+        "majority_radius": 1, "majority_iterations": 2, "min_region_area": 0.00002,
+        "shade_range": 0.6, "dissolve_unneeded": False, "depth_source": "none",
+    }),
+    "HARD": ("Hard surface (distinct colors)", "Automatic regions by hue, small distinct colors kept; no depth", {
+        "region_count": 0, "merge_distance": 0.06, "lightness_weight": 0.35, "shade_group_distance": 0.0,
+        "region_merge_distance": 0.0, "color_tolerance": 0.12, "darker_tolerance_stops": 4.0, "lighter_tolerance_stops": 1.0,
+        "majority_radius": 1, "majority_iterations": 2, "min_region_area": 0.0005,
+        "shade_range": 0.6, "dissolve_unneeded": False, "depth_source": "none",
+    }),
+    "DEFAULTS": ("Defaults", "Reset every setting except the texture and UV map", None),
+}
+
+
+class AO_REGIONS_OT_apply_preset(bpy.types.Operator):
+    bl_idname = "ao_regions.apply_preset"
+    bl_label = "Apply Preset"
+    bl_description = ("Set the group of settings that defines a kind of surface. Texture, UV map, convention, analysis "
+                      "size, triangle target and method are left alone (Defaults resets all but texture and UV map)")
+    bl_options = {"REGISTER", "UNDO"}
+
+    preset: EnumProperty(name="Preset", items=[(k, v[0], v[1]) for k, v in PRESETS.items()])
+
+    def execute(self, context):
+        props = context.scene.ao_regions
+        label, _, values = PRESETS[self.preset]
+        obj = context.active_object
+        size = max(obj.dimensions) if obj is not None and obj.type == "MESH" else 0.0
+        skipped = []
+        if values is None:
+            defaults = core.Settings()
+            values = {f.name: getattr(defaults, f.name) for f in fields(core.Settings)
+                      if f.name not in HIDDEN and f.name not in PRESET_KEEP}
+        for name, value in values.items():
+            if isinstance(value, tuple):
+                if size <= 0:
+                    skipped.append(name)
+                    continue
+                value = size * value[1]
+            setattr(props, name, value)
+        context.scene.ao_regions_preset = label           # saved with the file; settings may be edited afterwards
+        note = " (%s skipped: no active mesh to scale them to)" % ", ".join(skipped) if skipped else ""
+        self.report({"INFO"}, "Preset %s: %d settings set%s" % (label, len(values) - len(skipped), note))
+        for window in context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == "VIEW_3D":
+                    area.tag_redraw()
         return {"FINISHED"}
 
 
@@ -392,11 +480,22 @@ class AO_REGIONS_PT_main(bpy.types.Panel):
         col.prop_search(props, "image_name", bpy.data, "images", text="Texture")
         if not props.image_name:
             col.label(text="Empty: the image feeding Base Color", icon="INFO")
+        else:
+            used = texture_mismatch(obj, props.image_name)
+            if used:
+                warn = col.column(align=True)
+                warn.alert = True
+                warn.label(text="Not used by this object's material", icon="ERROR")
+                warn.label(text="It uses: %s" % ", ".join(used[:2]), icon="BLANK1")
         draw_field(col, props, "uv_layer", context)
         if not props.uv_layer:
             col.label(text="Empty: the active UV map", icon="INFO")
-        layout.operator("ao_regions.generate", icon="MOD_TRIANGULATE")
         wm = context.window_manager
+        row = layout.row(align=True)
+        row.operator_menu_enum("ao_regions.apply_preset", "preset", text="Preset", icon="PRESET")
+        if context.scene.ao_regions_preset:
+            row.label(text="Last: " + context.scene.ao_regions_preset.split(" (")[0])
+        layout.operator("ao_regions.generate", icon="MOD_TRIANGULATE")
         if wm.ao_regions_status:
             icon = {"RUNNING": "TIME", "DONE": "CHECKMARK", "FAILED": "ERROR"}.get(wm.ao_regions_status_state, "INFO")
             col = layout.column(align=True)
@@ -461,7 +560,8 @@ class AO_REGIONS_PT_ids(bpy.types.Panel):
 SECTION_PANELS = [p for p in (make_section_panel(i, t, n) for i, (t, n) in enumerate(SECTIONS)) if p]
 
 CLASSES = [AO_REGIONS_PG_settings, AO_REGIONS_PG_group,
-           AO_REGIONS_OT_generate, AO_REGIONS_OT_refresh, AO_REGIONS_OT_apply_ids, AO_REGIONS_OT_select_group,
+           AO_REGIONS_OT_generate, AO_REGIONS_OT_apply_preset, AO_REGIONS_OT_refresh, AO_REGIONS_OT_apply_ids,
+           AO_REGIONS_OT_select_group,
            AO_REGIONS_OT_preview, AO_REGIONS_UL_groups, AO_REGIONS_PT_main, *SECTION_PANELS, AO_REGIONS_PT_ids]
 
 
@@ -473,9 +573,11 @@ def register():
     bpy.types.Object.ao_region_groups_index = IntProperty()
     bpy.types.WindowManager.ao_regions_status = StringProperty(default="")
     bpy.types.WindowManager.ao_regions_status_state = StringProperty(default="")
+    bpy.types.Scene.ao_regions_preset = StringProperty(default="")
 
 
 def unregister():
+    del bpy.types.Scene.ao_regions_preset
     del bpy.types.WindowManager.ao_regions_status_state
     del bpy.types.WindowManager.ao_regions_status
     del bpy.types.Object.ao_region_groups_index

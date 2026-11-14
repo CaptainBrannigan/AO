@@ -177,3 +177,4 @@ The color-region baseline removes texture sampling and material proliferation fr
 - Whether AO and the shade channel should be merged into one channel.
 - Which Nanite outcome: PCVR-only tier vs. not used.
 - Whether vertex color alpha arrives without gamma conversion (it would be a cleaner home for the region ID).
+- **Region IDs on generated terrain (idea, 2026-11-11):** procedurally generated mesh terrain needs region IDs that can change at runtime (dirt paths, gravel), which the per-face vertex color can't do once a mesh is built. Candidates to test: write the IDs as vertex colors while the terrain mesh is generated; look the region up in the material from a small world-space region map produced by the same PCG pass; or lay paths down as their own thin meshes with their own IDs. See [Roadmap.md](Roadmap.md) "World generation".

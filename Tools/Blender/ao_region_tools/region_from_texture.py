@@ -38,6 +38,13 @@ from dataclasses import dataclass, fields, asdict
 
 import numpy as np
 
+try:
+    from . import targeted as _targeted
+except ImportError:                     # run as a plain script: the module sits next to this file
+    import os as _os
+    sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    import targeted as _targeted
+
 
 @dataclass
 class Settings:
@@ -66,6 +73,7 @@ class Settings:
     majority_iterations: int = 2
     min_region_area: float = 0.0005    # mesh islands smaller than this fraction of total area merge into their neighbor
     region_merge_distance: float = 0.0 # regions whose colors are closer than this (color feature distance) become one; 0 = off
+    shade_group_distance: float = 0.0  # regions of one hue/saturation (lightness ignored) within this become one region, their tones going to Shade; limited by darker_tolerance_stops; 0 = off
     convention: str = "0.2"            # "0.2" (up to 6 regions) or "0.125" (up to 9), see MeshAuthoring.md
 
     # --- Color tolerances ---
@@ -82,17 +90,30 @@ class Settings:
     index_remap: str = ""              # write_region_ids only: "from:to,..." onto your kit's index plan (default order: largest area first)
     apply_ids: str = ""                # separate step on an already processed object: "1:0,2:4,3:5" (group:region ID) writes RegionID
 
+    # --- Targeted detail ---
+    method: str = "subdivide"          # "subdivide": refine the whole mesh; "targeted": keep the base mesh and inject detail islands only where needed
+    targeted_area: str = "auto"        # "auto": base faces crossed by color borders (plus fold faces, per targeted_depth_scope); "selection": the source mesh's selected faces
+    targeted_depth_scope: str = "everywhere"  # height detail: "everywhere" (fold faces become islands too), "color_areas" (only inside color islands), "none"
+    targeted_tolerance_px: float = 1.0 # how closely island edges follow a painted boundary, in analysis texels (higher = fewer triangles)
+    targeted_depth_iterations: int = 6 # rounds of adding height points where folds are still missed by more than depth_subdiv_threshold
+    targeted_min_spacing_px: float = 2.0  # closest two height points may be, in analysis texels
+    targeted_keep_base_edges: bool = True # keep the base mesh's edges inside islands, so the surface shape stays exact
+
     # --- Geometry ---
-    max_subdiv_levels: int = 4         # how many times a face may be split in half to follow a boundary or fold
+    max_subdiv_levels: int = 6         # how many times a face may be split in half to follow a color boundary (painted letters need many)
     min_edge_length: float = 0.004     # world units: faces whose longest edge is shorter are not subdivided further
     boundary_tolerance_px: float = 0.75  # allowed average deviation of a cut from the true boundary, in analysis texels
     sample_spacing_px: float = 1.0     # sample spacing inside faces and along edges, in analysis texels
-    max_samples_per_edge: int = 16
+    max_samples_per_edge: int = 64     # cap on samples per face edge; below one per texel, thin strokes on large faces go unseen
     boundary_search_steps: int = 8     # bisection steps placing each cut on an edge
     min_split_fraction: float = 0.04   # cuts closer than this to an edge's end snap to the existing vertex
     seam_inset: float = 0.02           # samples are pulled this far toward the face center so UV seams don't read the neighbor island
     dissolve_unneeded: bool = True     # remove refinement vertices that ended up inside a single region
-    max_triangles: int = 600000        # safety limit for refinement
+    max_triangles: int = 600000        # target for the finished mesh: a reduction pass merges flat faces inside regions until it fits; 0 = no reduction
+    reduce_protection_strength: float = 10.0  # how strongly low weights (small regions, Shade detail, border neighbours) resist the reduction (decimate vertex-group factor)
+    reduce_small_region_protection: float = 0.5  # 0..1: smaller regions get a proportionally smaller angle (0 = same for all, 1 = scaled by area share)
+    reduce_shade_tolerance: float = 0.15   # linear Shade change between neighboring vertices at which the reduction weight halves (painted shading detail)
+    reduce_keep_original_vertices: bool = True  # never remove the source mesh's own vertices (skinning)
     decimate_ratio: float = 1.0        # < 1 adds an (unapplied) Decimate modifier that spares region boundaries
 
     # --- Shade (B channel) ---
@@ -118,10 +139,12 @@ class Settings:
     depth_highpass_px: int = 48        # normal source: removes large-scale drift from integration
     depth_smooth_iterations: int = 2   # mesh-space smoothing of the displacement
     depth_subdiv_threshold: float = 0.0015  # world units: refine where flat faces miss the fold by more than this
+    depth_subdiv_levels: int = 3       # how many times a face may be split in half to follow a fold (separate from color boundaries)
     normal_green: str = "directx"      # normal source: "directx" (UE) or "opengl" (Blender)
 
 
 SETTINGS = Settings()
+DEBUG_KEEP_LAYERS = False               # tests: keep internal layers (e.g. _rft_island) on the result mesh
 
 
 # ----------------------------------------------------------------------------------------------
@@ -292,6 +315,18 @@ def upstream_image(socket, depth=0):
     return None
 
 
+def material_image_names(obj):
+    """Names of every image texture in the object's materials."""
+    names = []
+    for slot in obj.material_slots:
+        mat = slot.material
+        if mat and mat.use_nodes:
+            for n in mat.node_tree.nodes:
+                if n.type == "TEX_IMAGE" and n.image and n.image.name not in names:
+                    names.append(n.image.name)
+    return names
+
+
 def find_material_image(obj, kind):
     for slot in obj.material_slots:
         mat = slot.material
@@ -437,6 +472,33 @@ def add_tolerance_regions(centers, feat, lum, solid, s, max_regions, rng):
     return np.array(C, dtype=np.float32)
 
 
+def shade_groups(centers, feat, lin, s):
+    """Groups region colors that are one color at different brightness: hue/saturation (a/L, b/L, lightness ignored)
+    within shade_group_distance of a group member, and no more than darker_tolerance_stops below the group's lightest
+    tone. Returns a group index per color, or None when off."""
+    if s.shade_group_distance <= 0 or len(centers) < 2:
+        return None
+    C = np.asarray(centers, dtype=np.float32)
+    lab, _ = assign(feat, C)
+    lum = luminance(lin)
+    ref = np.array([np.percentile(lum[lab == c], s.shade_reference_percentile) if np.any(lab == c) else 1e-6
+                    for c in range(len(C))])
+    group = -np.ones(len(C), dtype=np.int64)
+    members = []                                         # per group: list of colors, the first is the lightest
+    for c in np.argsort(-ref):
+        for gi, mem in enumerate(members):
+            close = min(np.linalg.norm(C[c, 1:] - C[m, 1:]) for m in mem) <= s.shade_group_distance
+            gap = np.log2(max(ref[mem[0]], 1e-6) / max(ref[c], 1e-6))
+            if close and (s.darker_tolerance_stops <= 0 or gap <= s.darker_tolerance_stops):
+                group[c] = gi
+                mem.append(c)
+                break
+        else:
+            group[c] = len(members)
+            members.append([c])
+    return group
+
+
 def merge_close_centers(X, C, distance):
     """Repeatedly joins the two closest region colors while they are within distance (sample-weighted mean)."""
     C = np.array(C, dtype=np.float32)
@@ -514,19 +576,24 @@ def inset(pts, cen, amount):
 # ----------------------------------------------------------------------------------------------
 # Refinement: which faces need splitting
 
+DETAIL_PRIORITY = 1e6                   # refinement priority of faces holding painted detail (letters, stripes)
+
+
 def analyze_mixed_face(L, B2, ring, uv_tri, W, H, tol_px):
-    """Decide whether one straight cut (or a 3-way junction) can represent this face's labels."""
+    """How much this face needs splitting to show its labels: 0 = one straight cut (or a 3-way junction) is enough,
+    DETAIL_PRIORITY = it holds detail a cut can't show (a feature inside it, a stripe, a saddle), otherwise the cut's
+    average deviation from the true boundary in multiples of tol_px (> 1)."""
     ring_labels = L[ring]
     if set(L.tolist()) - set(ring_labels.tolist()):
-        return True                         # a feature lies inside the face without touching its edges
+        return DETAIL_PRIORITY              # a feature lies inside the face without touching its edges
     R = len(ring)
     trans = [i for i in range(R) if ring_labels[i] != ring_labels[(i + 1) % R]]
     if not trans:
-        return False
+        return 0.0
     if len(trans) == 3:
-        return False                        # three-way junction: handled by a center vertex
+        return 0.0                          # three-way junction: handled by a center vertex
     if len(trans) != 2:
-        return True                         # 1 (inconsistent) or 4+ (stripe or saddle): split and look again
+        return DETAIL_PRIORITY              # 1 (inconsistent) or 4+ (stripe or saddle): split and look again
     t0, t1 = trans
     pa = (B2[ring[t0]] + B2[ring[(t0 + 1) % R]]) * 0.5
     pb = (B2[ring[t1]] + B2[ring[(t1 + 1) % R]]) * 0.5
@@ -535,68 +602,121 @@ def analyze_mixed_face(L, B2, ring, uv_tri, W, H, tol_px):
     ref_point = B2[ring[(t0 + 1) % R]]
     ref_side = d[0] * (ref_point[1] - pa[1]) - d[1] * (ref_point[0] - pa[0])
     if abs(ref_side) < 1e-9:
-        return True
+        return DETAIL_PRIORITY
     la = ring_labels[(t0 + 1) % R]
     lb = ring_labels[(t1 + 1) % R]
     pred = np.where(side * ref_side >= 0, la, lb)
     mismatch = np.count_nonzero(pred != L) / float(len(L))
     if mismatch == 0:
-        return False
+        return 0.0
     px = uv_tri * np.array([W, H])
     area_px = 0.5 * abs((px[1, 0] - px[0, 0]) * (px[2, 1] - px[0, 1]) - (px[2, 0] - px[0, 0]) * (px[1, 1] - px[0, 1]))
     bary3 = lambda p: np.array([1 - p[0] - p[1], p[0], p[1]])
     qa, qb = bary3(pa) @ px, bary3(pb) @ px
     length_px = max(np.linalg.norm(qb - qa), 1e-6)
-    return mismatch * area_px / length_px > tol_px
+    ratio = mismatch * area_px / length_px / max(tol_px, 1e-6)
+    return ratio if ratio > 1.0 else 0.0
 
 
-def faces_needing_refinement(uv, labelmap, dispmap, s):
+def faces_needing_refinement(uv, labelmap, dispmap, s, check_color=True, check_depth=True):
+    """Returns (color, depth, mixed): refinement priorities per face (0 = fine as is), color from analyze_mixed_face and
+    depth as how many times a flat face misses the fold by depth_subdiv_threshold, plus which faces a boundary crosses. Faces are sampled every sample_spacing_px texels (up to
+    max_samples_per_edge per edge), so a painted stroke narrower than that spacing can go unseen on a large face."""
     W, H = labelmap.w, labelmap.h
     px = uv * np.array([W, H])
     elen = np.max(np.stack([np.linalg.norm(px[:, 1] - px[:, 0], axis=1),
                             np.linalg.norm(px[:, 2] - px[:, 1], axis=1),
                             np.linalg.norm(px[:, 0] - px[:, 2], axis=1)]), axis=0)
     n = np.clip(np.ceil(elen / s.sample_spacing_px), 2, s.max_samples_per_edge).astype(np.int32)
-    need = np.zeros(len(uv), dtype=bool)
+    color = np.zeros(len(uv))
+    depth = np.zeros(len(uv))
+    mixed = np.zeros(len(uv), dtype=bool)
     for nv in np.unique(n):
-        sel = np.nonzero(n == nv)[0]
+        group = np.nonzero(n == nv)[0]
         B, ring, corners = tri_grid(int(nv))
-        tris = uv[sel]
-        pts = np.einsum("pk,fkd->fpd", B, tris)
-        pts = inset(pts, tris.mean(1, keepdims=True), s.seam_inset)
-        L = labelmap.nearest(pts)
-        mixed = np.nonzero((L != L[:, :1]).any(1))[0]
         B2 = B[:, 1:3]
-        for local in mixed:
-            if analyze_mixed_face(L[local], B2, ring, tris[local], W, H, s.boundary_tolerance_px):
-                need[sel[local]] = True
-        if dispmap is not None:
-            D = dispmap.bilinear(pts)
-            lin = D[:, corners] @ B.T
-            need[sel] |= np.abs(D - lin).max(1) > s.depth_subdiv_threshold
-    return need
+        step = max(1, int(4_000_000 // max(len(B), 1)))      # bounded memory for densely sampled large faces
+        for c0 in range(0, len(group), step):
+            sel = group[c0:c0 + step]
+            tris = uv[sel]
+            pts = np.einsum("pk,fkd->fpd", B, tris)
+            pts = inset(pts, tris.mean(1, keepdims=True), s.seam_inset)
+            L = labelmap.nearest(pts)
+            mixed_here = np.nonzero((L != L[:, :1]).any(1))[0]
+            mixed[sel[mixed_here]] = True
+            if check_color:
+                for local in mixed_here:
+                    color[sel[local]] = analyze_mixed_face(L[local], B2, ring, tris[local], W, H, s.boundary_tolerance_px)
+            if check_depth and dispmap is not None:
+                D = dispmap.bilinear(pts)
+                lin = D[:, corners] @ B.T
+                err = np.abs(D - lin).max(1) / max(s.depth_subdiv_threshold, 1e-9)
+                depth[sel] = np.where(err > 1.0, err, 0.0)
+    return color, depth, mixed
 
 
-def refine(bm, uvl, m3, labelmap, dispmap, s):
-    for level in range(s.max_subdiv_levels):
+REFINE_SAFETY_TRIANGLES = 5_000_000      # generation stops refining here (memory safety); max_triangles is met by reduction
+SPLIT_COST = 3.2                        # starting estimate: triangles added per face split (the face and its split neighbours)
+CROSSED_GROWTH = 2.5                    # starting estimate: crossed faces a split crossed face leaves
+CUT_COST = 2.0                          # triangles added per face a boundary is cut through
+
+
+def refine(bm, uvl, m3, labelmap, dispmap, s, budget, cut_cost=None):
+    """Color boundaries refine up to max_subdiv_levels, folds up to depth_subdiv_levels, so painted detail (letters)
+    can get much finer faces than creases need. The projected size of the finished mesh (after the boundary cut) stays
+    within budget; the split cost and how many crossed faces a split leaves are re-measured after every level."""
+    depth_levels = s.depth_subdiv_levels if dispmap is not None else 0
+    split_cost, crossed_growth = SPLIT_COST, CROSSED_GROWTH
+    cut_cost = CUT_COST if cut_cost is None else cut_cost
+    previous = None                     # (faces before, faces split, crossed before, crossed among the split)
+    for level in range(max(s.max_subdiv_levels, depth_levels)):
         faces, uv, vid = tri_arrays(bm, uvl)
         cow = world_coords(bm, m3)
         elen = np.max(np.stack([np.linalg.norm(cow[vid[:, 1]] - cow[vid[:, 0]], axis=1),
                                 np.linalg.norm(cow[vid[:, 2]] - cow[vid[:, 1]], axis=1),
                                 np.linalg.norm(cow[vid[:, 0]] - cow[vid[:, 2]], axis=1)]), axis=0)
-        need = faces_needing_refinement(uv, labelmap, dispmap, s) & (elen > s.min_edge_length)
+        color, depth, mixed = faces_needing_refinement(uv, labelmap, dispmap, s, check_color=level < s.max_subdiv_levels,
+                                                       check_depth=level < depth_levels)
+        big = elen > s.min_edge_length
+        priority = np.maximum(color, depth) * big
+        need = priority > 0
         count = int(need.sum())
-        log("refine level %d: %d of %d faces need splitting" % (level + 1, count, len(faces)))
+        log("refine level %d: %d of %d faces need splitting (%d for color detail, %d for color edges, %d for depth)" % (
+            level + 1, count, len(faces), int(((color >= DETAIL_PRIORITY) & big).sum()),
+            int(((color > 0) & (color < DETAIL_PRIORITY) & big).sum()), int(((depth > 0) & (color == 0) & big).sum())))
+        crossed = int(mixed.sum())
+        if previous is not None:
+            f0, n0, c0, cs0 = previous
+            if n0 > 0:
+                split_cost = max((len(faces) - f0) / float(n0), 1.0)
+            if cs0 > 0:
+                crossed_growth = max((crossed - (c0 - cs0)) / float(cs0), 1.0)
         if count == 0:
             break
-        if len(faces) + 4 * count > s.max_triangles:
-            log("WARNING: max_triangles reached, stopping refinement")
-            break
+        # the budget (safety limit) covers the finished refinement, so the projection includes the boundary cut that follows:
+        # each split adds split_cost triangles, each crossed face gains CUT_COST when it is cut, and a split crossed face
+        # turns into crossed_growth crossed faces
+        crossed_share = float((mixed & need).sum()) / max(count, 1)
+        per_split = split_cost + cut_cost * (crossed_growth - 1.0) * crossed_share
+        room = int((budget - len(faces) - cut_cost * crossed) // max(per_split, 1e-6))
+        if count > room:
+            if room <= 0:
+                log("WARNING: refinement safety limit reached, stopping refinement")
+                break
+            # spend what's left on the faces that need it most: painted detail first, then the worst-fitting cuts
+            keep = np.argsort(-priority)[:room]
+            need = np.zeros(len(faces), dtype=bool)
+            need[keep] = True
+            log("WARNING: refinement safety limit: splitting only the %d most needed of %d faces" % (room, count))
+        previous = (len(faces), int(need.sum()), crossed, int((mixed & need).sum()))
         edges = set()
         for i in np.nonzero(need)[0]:
             edges.update(faces[i].edges)
         bmesh.ops.subdivide_edges(bm, edges=list(edges), cuts=1, use_grid_fill=True)
         triangulate_non_tris(bm)
+    # crossed faces of the finished refinement, so the caller can measure what the cut really costs per crossed face
+    _, uv, _ = tri_arrays(bm, uvl)
+    return int(faces_needing_refinement(uv, labelmap, None, s, check_color=False, check_depth=False)[2].sum())
 
 
 # ----------------------------------------------------------------------------------------------
@@ -875,6 +995,109 @@ def dissolve_unneeded(bm, uvl, lab_layer, is_original, dispmap, s, max_passes=8)
     return total, kept_for_seams or 0
 
 
+def reduction_weights(bm, s):
+    """Per-vertex freedom for the reduction (0 = keep, 1 = remove freely). 0 on region borders, open mesh borders,
+    UV seams and marked seam/sharp edges, and (optionally) the source mesh's own vertices. Inside a region the weight is
+    the region's area share relative to the largest region, to the power reduce_small_region_protection, lowered where
+    Shade changes strongly between neighbors (reduce_shade_tolerance, in linear darkening)."""
+    grp = bm.faces.layers.int["RegionGroup"]
+    sh = bm.loops.layers.float_color.get("Shade")
+    orig = bm.verts.layers.int.get("_rft_orig")
+    uv_layers = list(bm.loops.layers.uv.values())
+    bm.verts.index_update()
+    nv = len(bm.verts)
+    vshade = np.zeros(nv)
+    if sh is not None:
+        for v in bm.verts:
+            ls = v.link_loops
+            if ls:
+                vshade[v.index] = sum(l[sh][0] for l in ls) / len(ls)
+        if s.precompensate:
+            vshade = srgb_to_linear(vshade).astype(np.float64)
+    area = {}
+    for f in bm.faces:
+        area[f[grp]] = area.get(f[grp], 0.0) + f.calc_area()
+    biggest = max(area.values()) if area else 1.0
+    region_scale = {g: max((a / biggest) ** s.reduce_small_region_protection, 0.02) for g, a in area.items()}
+    w = np.ones(nv)
+    for e in bm.edges:
+        fs = e.link_faces
+        locked = len(fs) != 2 or fs[0][grp] != fs[1][grp] or e.seam or not e.smooth             or fs[0].material_index != fs[1].material_index
+        if not locked:
+            la, lb = e.link_loops
+            for layer in uv_layers:          # UV seam: the two faces disagree on a corner's UV
+                ua = {la.vert: la[layer].uv, la.link_loop_next.vert: la.link_loop_next[layer].uv}
+                ub = {lb.vert: lb[layer].uv, lb.link_loop_next.vert: lb.link_loop_next[layer].uv}
+                if any(vert not in ub or (uv - ub[vert]).length > 1e-5 for vert, uv in ua.items()):
+                    locked = True
+                    break
+        a, b = e.verts
+        if locked:
+            w[a.index] = 0.0
+            w[b.index] = 0.0
+        elif sh is not None and s.reduce_shade_tolerance > 0:
+            f = 1.0 / (1.0 + abs(vshade[a.index] - vshade[b.index]) / s.reduce_shade_tolerance)
+            w[a.index] = min(w[a.index], f)
+            w[b.index] = min(w[b.index], f)
+    for v in bm.verts:
+        if w[v.index] == 0.0:
+            continue
+        if s.reduce_keep_original_vertices and orig is not None and v[orig]:
+            w[v.index] = 0.0
+            continue
+        fs = v.link_faces
+        w[v.index] *= region_scale.get(fs[0][grp], 1.0) if fs else 0.0
+    return w
+
+
+def reduce_to_budget(bm, s, vertex_group_names):
+    """Reduces the finished mesh to max_triangles with Blender's collapse decimation (quadric error: flat, uniform areas
+    go first, creases last), steered by reduction_weights: edges between two weight-0 vertices (region borders, seams)
+    are never collapsed, and lower weights make collapsing more expensive (reduce_protection_strength).
+    Returns a new bmesh (the input is freed)."""
+    if s.max_triangles <= 0 or len(bm.faces) <= s.max_triangles:
+        return bm
+    start = len(bm.faces)
+    weights = reduction_weights(bm, s)
+    tmp_me = bpy.data.meshes.new("_rft_reduce")
+    bm.to_mesh(tmp_me)
+    tmp = bpy.data.objects.new("_rft_reduce", tmp_me)
+    bpy.context.scene.collection.objects.link(tmp)
+    try:
+        for name in vertex_group_names:                  # keep bone-weight indices lined up
+            tmp.vertex_groups.new(name=name)
+        vg = tmp.vertex_groups.new(name="_rft_reduce_weight")
+        levels = np.round(weights * 50) / 50.0
+        for value in np.unique(levels):
+            idx = np.nonzero(levels == value)[0].tolist()
+            if value > 0 and idx:
+                vg.add(idx, float(value), "REPLACE")
+        mod = tmp.modifiers.new("reduce", "DECIMATE")
+        mod.decimate_type = "COLLAPSE"
+        mod.ratio = min(1.0, s.max_triangles / float(start) * 0.995)
+        mod.vertex_group = vg.name
+        mod.vertex_group_factor = s.reduce_protection_strength
+        mod.use_collapse_triangulate = True
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        out_me = bpy.data.meshes.new_from_object(tmp.evaluated_get(depsgraph))
+        nb = bmesh.new()
+        nb.from_mesh(out_me)
+        bpy.data.meshes.remove(out_me)
+        dl = nb.verts.layers.deform.active
+        if dl is not None:                               # drop the helper group's weights
+            gi = vg.index
+            for v in nb.verts:
+                if gi in v[dl]:
+                    del v[dl][gi]
+    finally:
+        bpy.data.objects.remove(tmp)
+        bpy.data.meshes.remove(tmp_me)
+    bm.free()
+    log("reduced %d -> %d triangles (max_triangles %d); %.0f%% of vertices locked (borders, seams, originals)" % (
+        start, len(nb.faces), s.max_triangles, 100.0 * float((weights == 0).mean())))
+    return nb
+
+
 def fill_missing_weights(bm, new_verts):
     """Safety net: a new vertex with no bone weights takes the average of its neighbors."""
     dl = bm.verts.layers.deform.active
@@ -1061,6 +1284,10 @@ def run(s, save_path="", report_path=""):
         raise RuntimeError("No color texture found (set image_name)")
     uv_name = s.uv_layer or src.data.uv_layers.active.name
     log("object %s, image %s %s, uv %s" % (src.name, img.name, tuple(img.size), uv_name))
+    used = material_image_names(src)
+    if s.image_name and used and img.name not in used:
+        log("WARNING: texture %s isn't used by %s's material (it uses %s); the regions will follow %s through this mesh's UVs"
+            % (img.name, src.name, ", ".join(used[:3]), img.name))
 
     # --- texture analysis -----------------------------------------------------------------------
     px = image_pixels(img)[..., :3]
@@ -1130,6 +1357,16 @@ def run(s, save_path="", report_path=""):
         raise RuntimeError("%d regions exceed the %s convention's %d" % (k, s.convention, max_regions))
 
     labels, _ = assign(feat_full, centers.astype(np.float32))
+    group_of = shade_groups(centers, sample_feat, sample_lin, s)
+    if group_of is not None and group_of.max() + 1 < k:
+        # every texel keeps its nearest color's boundaries, then takes that color's group: tones of one color become Shade
+        n_groups = int(group_of.max()) + 1
+        labels = group_of[labels]
+        sl, _ = assign(sample_feat, centers.astype(np.float32))
+        sg = group_of[sl]
+        centers = np.array([sample_feat[sg == j].mean(0) for j in range(n_groups)], dtype=np.float32)
+        log("shade_group_distance grouped %d region colors into %d regions" % (k, n_groups))
+        k = n_groups
     labels = labels.reshape(H, W).astype(np.int8)
     labels = majority_filter(labels, k, s.majority_radius, s.majority_iterations)
     labelmap = Map(labels)
@@ -1155,6 +1392,11 @@ def run(s, save_path="", report_path=""):
     shade = np.clip((y_ref[labels] - Y) / np.maximum(y_ref[labels] * s.shade_range, 1e-6), 0.0, 1.0).astype(np.float32)
     shade_map = Map(shade)
     sample_shade = shade_map.nearest(sample_uv)
+    # how much shade_range each region needs so its darkest 5% of tones aren't clipped at Shade 1
+    shade_needed = [float(np.clip(1 - np.percentile(sample_Y[sample_lab == c], 5) / max(y_ref[c], 1e-6), 0, 1))
+                    if np.any(sample_lab == c) else 0.0 for c in range(k)]
+    log("shade_range needed per region (darkest 5%% of tones): %s; current %.2f" % (
+        ", ".join("%.2f" % v for v in shade_needed), s.shade_range))
     palette_lin = []
     for c in range(k):
         mask = (sample_lab == c) & (sample_shade <= 0.1)
@@ -1246,8 +1488,16 @@ def run(s, save_path="", report_path=""):
     same_eps = max(max(dims), 1e-6) * 1e-7
     is_original = lambda v: kd.find(v.co)[2] <= same_eps
 
-    refine(bm, uvl, m3, labelmap, dispmap, s)
-    cut_boundaries(bm, uvl, labelmap, s)
+    # generation isn't capped by max_triangles (the reduction pass at the end is); a high safety limit only stops runaway settings
+    island_layer = None
+    if s.method == "targeted":
+        island_layer = _targeted.targeted_inject(bm, uvl, labelmap, dispmap, s, faces_needing_refinement, tri_arrays, log)
+        triangulate_non_tris(bm)
+        log("%d triangles after injecting detail islands" % len(bm.faces))
+    else:
+        refine(bm, uvl, m3, labelmap, dispmap, s, REFINE_SAFETY_TRIANGLES)
+        cut_boundaries(bm, uvl, labelmap, s)
+        log("%d triangles after refinement and the boundary cut" % len(bm.faces))
     lab_layer = bm.faces.layers.int.new("_rft_label")
     label_faces(bm, uvl, labelmap, lab_layer)
     distinct = []
@@ -1259,7 +1509,9 @@ def run(s, save_path="", report_path=""):
     log("merged %d small islands" % merged)
 
     dissolved = 0
-    if s.dissolve_unneeded:
+    if s.dissolve_unneeded and s.method == "targeted":
+        log("dissolve_unneeded skipped: targeted islands only hold vertices they need")
+    elif s.dissolve_unneeded:
         dissolved, kept_for_seams = dissolve_unneeded(bm, uvl, lab_layer, is_original, dispmap, s)
         log("dissolved %d unneeded vertices (%d kept on UV seams / material / sharp edges)" % (dissolved, kept_for_seams))
     else:
@@ -1311,6 +1563,11 @@ def run(s, save_path="", report_path=""):
             l[shade_layer] = (float(v), float(v), float(v), 1.0)
     bm.faces.layers.int.remove(lab_layer)
 
+    # original vertices, flagged before depth moves them (the position lookup can't find them afterwards)
+    orig_layer = bm.verts.layers.int.new("_rft_orig")
+    for v in bm.verts:
+        v[orig_layer] = 1 if is_original(v) else 0
+
     # --- depth ----------------------------------------------------------------------------------
     if dispmap is not None:
         d = vertex_displacement(bm, uvl, dispmap, s)
@@ -1319,8 +1576,11 @@ def run(s, save_path="", report_path=""):
         bvh = mathutils.bvhtree.BVHTree.FromBMesh(bm) if s.depth_max_thickness < 1.0 else None
         eps = same_eps * 1e3
         moves, limited = [], 0
+        isl = bm.verts.layers.int.get(island_layer) if island_layer else None
         for v in bm.verts:
             dv = d[v.index]
+            if isl is not None and v[isl] != 1:
+                continue                                    # targeted: only island interiors move
             if abs(dv) < 1e-7:
                 continue
             n = v.normal.copy()
@@ -1337,6 +1597,12 @@ def run(s, save_path="", report_path=""):
         for v, offset in moves:
             v.co += offset
         log("displaced %d vertices (max %.4f), %d limited by thickness" % (len(moves), float(np.abs(d).max()), limited))
+
+    # --- reduction to max_triangles -------------------------------------------------------------
+    bm = reduce_to_budget(bm, s, [vg.name for vg in obj.vertex_groups])
+    bm.verts.layers.int.remove(bm.verts.layers.int["_rft_orig"])
+    if island_layer and bm.verts.layers.int.get(island_layer) is not None and not DEBUG_KEEP_LAYERS:
+        bm.verts.layers.int.remove(bm.verts.layers.int[island_layer])
 
     tris_after = len(bm.faces)
     bm.to_mesh(me)
@@ -1382,6 +1648,7 @@ def run(s, save_path="", report_path=""):
             "srgb_hex": linear_to_hex(palette_lin[c]),
             "linear_rgb": [round(float(x), 5) for x in palette_lin[c]],
             "surface_share": round(float(area_share[c]), 4),
+            "shade_range_needed": round(shade_needed[c], 3),
         }, **({"index": index_of[c], "custom_primitive_data_index": index_of[c] * 4,
                "region_id_value": table[index_of[c]]} if s.write_region_ids else {})) for c in group_order],
         "settings": asdict(s),

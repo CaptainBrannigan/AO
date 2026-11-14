@@ -39,3 +39,18 @@ Alongside: define the "why play?" (see [Vision.md](Vision.md)).
 ## Physics & destruction
 
 - Profile Chaos destruction cost first; then prototype the Chaos-event / Box3D-cosmetic split on one structure. → [Physics.md](Physics.md)
+
+## World generation (idea, 2026-11-11, unverified)
+
+Procedurally generated maps on mesh terrain, built per session while the player prepares in the base.
+
+- **Mesh terrain:** the 5.8 source has it as experimental plugins: `MeshPartition` ("large-scale mesh authoring through spatial partitioning, non-destructive modifier editing, platform-adaptive runtime representations"), `MeshTerrainMode` (editor tools) and `PCGMeshPartitionInterop`. It reads as an extension of Nanite and landscape that PCG can deform.
+- **Flow:** the map starts as a completely flat base with the player's base on it. The player spawns in the basement and can't see the map. While they move through the base preparing to infil, the map generates. When it's done, the infil helicopter becomes available and the player enters the match. The map stays for as long as that session is open, so every new session gets a different map.
+- **Perception data for free:** PCG deforms the terrain and places the props, so the tactical grid for AI perception can be generated in parallel from the same data, exactly as it is placed. That would replace the capture bake for generated maps. → [AI.md](AI.md) "Building the grid"
+- **Determinism:** PCG can be deterministic, so each client could generate the map itself from a shared seed, as long as everything is driven by that seed.
+- **Hard limitation, the one-material setup:** unless face region IDs can be reassigned at runtime, generated terrain can't be recolored for dirt paths, gravel and the like. → [Rendering.md](Rendering.md) "Open questions"
+
+**To verify first:**
+- Whether Mesh Partition can be modified at runtime at all. Its Boolean and Mesh Project modifiers sit in the editor module, so generation may be editor-only as shipped.
+- Whether a generated terrain mesh can carry vertex colors (region IDs) written at generation time.
+- Generation time on the target hardware while the player is in the base, and whether per-client generation stays identical across machines (float determinism).

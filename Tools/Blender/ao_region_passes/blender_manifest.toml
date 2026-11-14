@@ -1,0 +1,15 @@
+schema_version = "1.0.0"
+
+id = "ao_region_passes"
+version = "0.1.2"
+name = "AO Color Region Passes"
+tagline = "Color regions pass by pass: maps, geometry, depth, reduction"
+maintainer = "Jordan Cain"
+type = "add-on"
+
+blender_version_min = "4.2.0"
+
+# Blender add-ons link against Blender's GPL Python API, so a GPL-compatible license is required
+license = ["SPDX:GPL-3.0-or-later"]
+
+tags = ["Mesh", "Modeling", "Material"]

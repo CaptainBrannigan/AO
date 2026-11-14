@@ -1080,6 +1080,7 @@ Intelligence can set the prediction time and the precision used (see "Character 
 - How AO bounds are chosen, and how often they move. They only decide where overlays apply now.
 - Characters aren't in the grid. Is a separate check needed for bodies blocking sight?
 - Delegated brains: the client running an area's AI needs the grid. The baked tier ships with the map; overlays and repairs would have to be applied on that client too.
+- **Generated maps (idea, 2026-11-11):** if maps are generated per session by PCG on mesh terrain, the grid could be built in parallel from the PCG data as terrain and props are placed, instead of baked from captures. Each client would build it from the same seed. See [Roadmap.md](Roadmap.md) "World generation".
 
 ## Performance
 
