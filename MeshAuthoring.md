@@ -13,6 +13,8 @@ Checklist for authoring meshes that use the textureless color-region material (s
 > **This applies to skeletal meshes only (found 2026-11-13, UE 5.8 source).** The FBX importer decodes vertex colors sRGB → linear for every mesh type. The **skeletal** build stores the result as is (`ToFColor(false)` in `SkeletalMeshLODImporterData.cpp`), so the material receives the linear value and needs the pre-compensated tables. The **static mesh** build re-encodes to sRGB (`ToFColor(true)` in `StaticMeshBuilder.cpp`), so the material receives the **file value unchanged**. A static mesh therefore needs plain values: region k = k/8 (or k/5), and Shade as the linear darkening amount (no pre-compensation). With pre-compensated values a static mesh decodes regions 1–3 as 3–5 and its shading comes out too dark. Import characters and clothing as skeletal meshes.
 >
 > The passes add-on writes either encoding: **Import in UE as** (Skeletal / Static), in the Region IDs panel and under Geometry > Output (0.1.2). Apply IDs writes RegionID for the chosen type and re-encodes an existing Shade to match, so a mesh can be switched without rebuilding geometry. Each mesh records the type it was written for (`aop_vc_encoding` on the mesh data, carried to the reduced and export copies), and the panel warns when it differs from the setting. Static values: 0.125 convention `0, 0.125, 0.25 … 1.0`; 0.2 convention `0, 0.2 … 1.0`.
+>
+> **Nanite skinned meshes lose vertex colors entirely** in UE 5.8: the Nanite skeletal build doesn't copy them (`// TODO: Nanite-Skinning` in `SkeletalMeshBuilder.cpp`), so every face decodes as one region. Static Nanite meshes keep them. Fixed in the 5.9 dev branch; the project waits for 5.9. See AI.md → "AI rendering test plan".
 
 ## Region ID encoding (R channel)
 
@@ -193,7 +195,7 @@ On a synthetic rigged sphere: 4,278 vs 14,166 triangles for subdivide, 98.8% of 
 
 ### Pass-by-pass version (AO Color Region Passes, separate add-on)
 
-[Tools/Blender/ao_region_passes](Tools/Blender/ao_region_passes) (`dist/ao_region_passes-0.1.2.zip`) is the same tool split into passes, each with its own button, so a setting can be changed and only its pass re-run. It is a separate extension, with its own sidebar tab (**AO Passes**), operators, stored settings and engine copy, so it installs alongside AO Color Regions without affecting it.
+[Tools/Blender/ao_region_passes](Tools/Blender/ao_region_passes) (`dist/ao_region_passes-0.1.3.zip`) is the same tool split into passes, each with its own button, so a setting can be changed and only its pass re-run. It is a separate extension, with its own sidebar tab (**AO Passes**), operators, stored settings and engine copy, so it installs alongside AO Color Regions without affecting it.
 
 **How the mesh is made.** Every run turns the texture into three maps, and builds the geometry from them. Color settings never place vertices: they decide the region map, and geometry can only follow boundaries that exist in it.
 
@@ -210,6 +212,7 @@ On a synthetic rigged sphere: 4,278 vs 14,166 triangles for subdivide, 98.8% of 
 - **Regions / Shade / Folds** (under Analyze) open a map in an Image Editor. Use them to check what counts as a color and what as height before building geometry.
 - **Painting on the region map** fixes a region by hand. Paint with a region's exact color (eyedropper from the map), then re-run Geometry. In the test, a painted block became that region on all 9 faces it covered. Use Image > Pack afterwards to keep the edit in the file.
 - **Flatten** (under Depth) removes depth without rebuilding.
+- **Keeping a result (0.1.3):** rename it. Each source points to its current Geometry and Reduce results, and the pointer follows renames, so Depth and Reduce keep working on the result you renamed. The next Geometry run builds a new `<source>_Passes` and leaves the renamed one alone. Only a result that still has the standard name is replaced. A duplicate (Shift+D) is a copy the passes never touch; the main panel warns when one is selected and names the result the passes use. Files from 0.1.2 and earlier have no pointer yet: the newest Geometry result counts as current until the next run sets it.
 - Depth's fold detail is placed by Geometry using the Depth strength at that time; the Depth panel says so when the strength has changed a lot since.
 
 **Where vertices around colors come from**, in order of effect: the color must exist in the region map (check with Regions); `analysis_size` at the texture's full size; `majority_iterations` 1 or `majority_radius` 0 so thin strokes survive; a small `min_split_fraction` (about 0.02) so cuts don't snap to nearby vertices; more color levels and a smaller `boundary_tolerance_px` (Subdivide) or a smaller `targeted_tolerance_px` (Targeted).

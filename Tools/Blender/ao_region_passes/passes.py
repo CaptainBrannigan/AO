@@ -81,23 +81,59 @@ def source_of(obj):
     return obj if obj.type == "MESH" else None
 
 
+# the source object points at its current results (Object pointer properties registered in __init__), so renaming a
+# result keeps it current and a copy of a result (Shift+D, which copies the tags too) is never mistaken for it
+RESULT_POINTERS = {"full": "aop_result_full", "reduced": "aop_result_reduced"}
+
+
+def _in_scene(o):
+    return o is not None and len(o.users_collection) > 0
+
+
+def _result_time(o, kind):
+    rec = _record(o, "aop_geometry" if kind == "full" else "aop_reduce")
+    return rec.get("time", 0.0) if rec else 0.0
+
+
 def result_of(src, kind="full"):
+    """The result the passes work on: the object the source points to (set whenever Geometry or Reduce makes one,
+    and it follows renames). Without a pointer (files from 0.1.2 and earlier) the newest object tagged as this
+    source's result of that kind, the one with the standard name winning a tie."""
     if src is None:
         return None
-    for o in bpy.data.objects:
-        if o.get("aop_source") == src.name and o.get("aop_kind") == kind:
-            return o
-    return None
+    prop = RESULT_POINTERS.get(kind)
+    ptr = getattr(src, prop, None) if prop else None
+    if _in_scene(ptr) and ptr.get("aop_kind") == kind and ptr.get("aop_source") == src.name:
+        return ptr
+    standard = src.name + (REDUCED_SUFFIX if kind == "reduced" else RESULT_SUFFIX)
+    found = [o for o in bpy.data.objects
+             if o.get("aop_source") == src.name and o.get("aop_kind") == kind and _in_scene(o)]
+    if not found:
+        return None
+    return max(found, key=lambda o: (_result_time(o, kind), o.name == standard))
+
+
+def is_snapshot(obj):
+    """A copy of a result (tagged like one, but not the result its source points to)."""
+    src = source_of(obj)
+    kind = obj.get("aop_kind") if obj is not None else None
+    if src is None or kind not in RESULT_POINTERS:
+        return False
+    current = result_of(src, kind)
+    return current is not None and current is not obj
 
 
 def _replace_result(src, kind, base, name):
-    """A fresh copy of `base` as this pass's result; the previous result of the same kind (made by this add-on) goes."""
+    """A fresh copy of `base` as this pass's result. The previous result of the same kind goes only while it still has
+    the standard name; a result you renamed is kept (as a copy), so renaming is how you keep one."""
     old = result_of(src, kind)
-    if old is not None:
+    if old is not None and old is not base and (old.name == name or old.name.startswith(name + ".")):
         me = old.data
         bpy.data.objects.remove(old)
         if me.users == 0:
             bpy.data.meshes.remove(me)
+    elif old is not None:
+        log("keeping %s: it was renamed, so it stays as a copy" % old.name)
     obj = base.copy()
     obj.data = base.data.copy()
     obj.name = name
@@ -109,6 +145,9 @@ def _replace_result(src, kind, base, name):
     obj["aop_kind"] = kind
     for col in base.users_collection:
         col.objects.link(obj)
+    prop = RESULT_POINTERS.get(kind)
+    if prop and hasattr(src, prop):
+        setattr(src, prop, obj)
     return obj
 
 

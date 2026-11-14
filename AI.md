@@ -1299,6 +1299,30 @@ Also worth an A/B once animation is in: Update Rate Optimization and AnimationSh
 - **The velocity pass is only needed for temporal AA (TAA/TSR) or motion blur.** Check which AA the deferred builds actually use (MSAA, the configured method, is forward-only); if not temporal, velocity output is ~0.6 ms of wasted GPU.
 - Frame pacing held 120 Hz in both runs.
 
+- **Nanite skinned meshes, same test (2026-11-13, packaged, SteamVR, 100 close animated characters with the Animation Blueprint, shadows on, buffered occlusion queries).** The mannequin asset (`SKM_Manny_Simple_5_7_ColorGroups`) with Nanite enabled; `r.Nanite.AllowSkinnedMeshes` is on by default in 5.8. Proof it took effect: GPU skin-cache dispatches 107 → 2 per frame (only the hands), traditional base-pass draws 0.63 → 0.06 ms (the hands), and no traditional velocity draws at all. Against the 10-26 run, plus a same-day non-Nanite repeat (same build before the Nanite cook) to separate day-to-day drift:
+
+  | | Non-Nanite 10-26 | Non-Nanite repeat 11-13 | **Nanite skinned** |
+  |---|---|---|---|
+  | GPU scene (`Scene`) | 5.50 ms | 5.83 ms | **4.22 ms** |
+  | GPU skin cache | 0.33 ms | 0.27 ms | ~0 |
+  | Velocity pass | 0.63 ms | 0.65 ms | **0** (Nanite writes velocity in its own raster) |
+  | Base pass (traditional + Nanite) | 1.12 ms | 1.15 ms | 0.57 ms |
+  | Shadow depths (VSM) | 0.74 ms | 0.76 ms | 0.52 ms |
+  | Nanite VisBuffer (trees + crowd) | 0.73 ms | 0.90 ms | 0.77 ms |
+  | Game thread work | 3.44 ms | 3.67 ms | 3.63 ms |
+  | Render thread (`FDeferredShadingSceneRenderer_Render`) | 1.99 ms | 2.07 ms | 2.04 ms |
+  | Worker threads, total foreground work | 14.2 ms | 14.2 ms | 13.3 ms |
+  | Frames over 12.5 ms | 0.11% | 2.50% | 0.08% |
+
+  **GPU about 1.3–1.6 ms cheaper (roughly −25% of the scene), CPU unchanged.** Nanite raster for the 100 characters costs almost nothing on top of the trees (VisBuffer +0.04 ms against 10-26), while the skin cache, the velocity pass (the ~0.6 ms flagged earlier as the biggest removable GPU item) and most of the traditional base pass disappear, and VSM shadow depths drop 0.23 ms. Game and render thread cost is the same, as expected: animation and component tick don't change, so the per-character CPU cost (~20 µs) is still the next limit. The 2.5% hitching in the same-day repeat came with `xrWaitFrame` spikes right after an OpenXR runtime switch (Virtual Desktop → SteamVR), not from the game. **Caveat:** the UE mannequin is low-poly, so this measures Nanite skinning's fixed per-character cost; the dense color-region meshes (the 278k–1.35M-tri torso) are where its automatic LOD should matter most, and are the next run once skinned. **Direction:** Nanite skinned for the merged character body; see [Rendering.md](Rendering.md) → "Character composition".
+- **⚠ Nanite skinned meshes have no vertex colors in 5.8.** The Nanite build for skeletal meshes never copies them: the two lines are commented out under `// TODO: Nanite-Skinning` in `SkeletalMeshBuilder.cpp` (`InputMeshData.Vertices.Color`), and `NaniteBuilder.cpp` only stores colors when that array is filled. Every face then decodes as the same region, so the Nanite mannequins showed a single color. Static Nanite meshes keep their colors (`StaticMeshBuilder.cpp` fills them), and UV channels are copied for skinned Nanite too. Lines 707–708 and 777 of the local 5.8.4 source. **Decision (2026-11-14): wait for 5.9**, whose dev branch copies the colors, instead of patching the engine or moving region data to a UV channel (that option stays in [Rendering.md](Rendering.md) → "Color regions" if 5.9 slips). Until then, Nanite skinned test meshes show one region; static Nanite pieces are unaffected. The performance numbers above stand: with one region instead of four, the material and geometry cost the same.
+
+**Socketed static meshes and instanced crowds (planned, 2026-11-13).** Rigid pieces are easier to author than perfect seams on a skinned mesh, and an instanced version is the route to large AI groups in the distance. Same scene and route as the Nanite skinned run (100 characters, VR, shadows on); the mannequin split into about 19 rigid pieces (twist bones merged into their limb, fingers into the hand), each a static Nanite mesh:
+1. **Hidden skeleton + socketed pieces:** per character, a skeletal mesh component with Visible and Cast Shadow off and *Always Tick Pose and Refresh Bones* (so it keeps animating hidden), plus the pieces attached to their bones. Removes skeletal rendering; adds ~1,900 moving primitives (transform update on the game thread and GPU scene upload each frame). Answers whether pieces beat Nanite skinning in practice.
+2. **No skeletal meshes at all (instanced):** the idle animation's bone transforms baked once into a data asset; one C++ manager plays them back by batch-updating one instanced static mesh (Nanite) per piece type, about 19 components for all 100 characters. Removes skeletal components and the per-component cost. This is the shape of the distant-crowd LOD (see "Bodies as baked-animation static meshes" above), and the floor for a scene without skeletal meshes.
+
+Compare against the skinned and Nanite skinned rows above: game thread (per-character and per-component cost), render thread, GPU scene, VSM shadow depths, frames over 12.5 ms. Static pieces need the static vertex color encoding (MeshAuthoring.md).
+
 **Next runs:** tick off + shadows off (fixed cost floor); then animated with *Use Animation Asset* (pure evaluation + skinning), then an Animation Blueprint (its overhead), with Update Rate Optimizations / *Visibility Based Anim Tick Option* A/B.
 
 ## Networking

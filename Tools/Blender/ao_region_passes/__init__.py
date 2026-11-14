@@ -627,6 +627,14 @@ def draw_main(self, context):
         layout.label(text="Source: %s" % src.name, icon="MESH_DATA")
         if obj is not src:
             layout.label(text="Active: %s" % obj.name, icon="BLANK1")
+        full = P.result_of(src, "full")
+        if full is not None:
+            layout.label(text="Geometry result: %s" % full.name, icon="BLANK1")
+        if P.is_snapshot(obj):
+            warn = layout.column(align=True)
+            warn.alert = True
+            warn.label(text="This is a copy. Passes work on", icon="ERROR")
+            warn.label(text=P.result_of(src, obj.get("aop_kind")).name, icon="BLANK1")
     col = layout.column()
     col.prop_search(props, "image_name", bpy.data, "images", text="Texture")
     if not props.image_name:
@@ -771,6 +779,8 @@ def register():
     bpy.types.Scene.aop_preset = StringProperty(default="")
     bpy.types.Object.aop_region_groups = CollectionProperty(type=AOP_PG_group)
     bpy.types.Object.aop_region_groups_index = IntProperty()
+    for prop in P.RESULT_POINTERS.values():
+        setattr(bpy.types.Object, prop, PointerProperty(type=bpy.types.Object))
     bpy.types.WindowManager.aop_status = StringProperty(default="")
     bpy.types.WindowManager.aop_status_state = StringProperty(default="")
 
@@ -779,6 +789,8 @@ def unregister():
     del bpy.types.WindowManager.aop_status_state
     del bpy.types.WindowManager.aop_status
     del bpy.types.Object.aop_region_groups_index
+    for prop in P.RESULT_POINTERS.values():
+        delattr(bpy.types.Object, prop)
     del bpy.types.Object.aop_region_groups
     del bpy.types.Scene.aop_preset
     del bpy.types.Scene.aop_settings
