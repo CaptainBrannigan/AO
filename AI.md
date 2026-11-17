@@ -12,7 +12,7 @@ DMZ-style density: many AI that stay interesting, in player-hosted sessions wher
 
 ## Current direction
 
-- Land the Purpose system fixes under "Performance" first. The load-balancer bug and the fixed-sleep throughput cap change how the system behaves under real load, not just its efficiency.
+- Build revision 4 in the order of "Purpose refactor: implementation order", starting with the manager. The load-balancer bug and the fixed-sleep throughput cap land in its first phase; they change how the system behaves under real load, not just its efficiency.
 - Separate perception from decision (see "Behavior design") before scaling up AI density.
 - Render distant AI cheaply: kit as attached static meshes, and baked-animation static meshes for distant bodies (see "Rendering AI at scale").
 
@@ -265,9 +265,10 @@ An intent is authored once and varied by its reference: cover from the Instigato
 - **Selection takes as many purposes as fit:**
   1. Take the best-scoring purpose.
   2. Then take the next best whose resources don't overlap what's already taken.
-  3. Repeat until resources run out or scores fall below a floor.
+  3. Repeat until resources run out, the candidate's Multitask limit is reached, or scores fall below a floor.
 
   Each purpose taken must beat every current behavior that holds a resource it needs, and ends only those.
+- **Multitask limits how many behaviors run at once (added 2026-11-17).** Free resources aren't enough on their own: how many behaviors an AI runs at once comes from its Multitask attribute, derived from Intelligence and Fear (see "Character attributes"). Current behaviors that keep running count against it, and so do self-reactions. A panicking recruit runs for cover but doesn't also call it out; a veteran moves, calls out and readies its weapon together.
 - **Suggested layers:**
   - Locomotion: Pathing, Rotation, LowerBody.
   - Hands: Arms, UpperBody (the weapon).
@@ -508,6 +509,11 @@ Attributes give AI their own character without hardcoded archetype paths.
   - **Coordination.** Leading, awaiting orders and relaying information are purposes gated by Intelligence.
 - **Discipline** weighs a heard order against Fear. A disciplined AI follows the order even under fire; an undisciplined one keeps reacting on its own. It's part of what sets a squad's grade (see "Squad coordination").
 - **Focus, boredom and distraction (revision 4)** are attributes too, changed by GEs, never by a decaying score. A guard who bores easily gains boredom faster on patrol. When the next occurrence re-scores the patrol (see "Evaluation"), its conditions read Boredom and score lower, and distraction purposes read it too. So a smaller occurrence pulls that guard away than a disciplined one. The change still waits for an occurrence (see "Principles").
+- **Multitask (added 2026-11-17)** is how many behaviors the AI can run at once, across layers (see "Behavior layers").
+  - **One calculation in one place.** An innate infinite GE sets it through a `UGameplayModMagnitudeCalculation` that captures Intelligence and Fear. With the captures not snapshotted, GAS re-evaluates the active GE whenever either attribute changes (`FGameplayEffectAttributeCaptureSpec::RegisterLinkedAggregatorCallback`, `GameplayEffect.cpp`), so Multitask follows Fear as it rises and falls, and nothing ticks.
+  - **Current state through tags and other GEs.** Modifiers in the GE can require State tags (`State.Suppressed` lowers it), and other GEs can modify it too: exhaustion, a stun, a drug.
+  - **The formula is open.** Plain Intelligence ÷ Fear blows up as Fear nears 0. Something like Intelligence × (1 − Fear), or a curve over both, keeps it bounded. Selection rounds it down, with a minimum of 1, so even a terrified AI still does one thing.
+  - Selection reads it from the candidate snapshot like any attribute.
 - **Equipment carries GEs, not attributes (decided 2026-11-16).** Each item can carry different GEs or magnitudes, so no two weapons need be the same. There's no attribute set and no ASC on equipment.
   - **Only what's in hand is equipped.** Holstered or slung items are world items that happen to be socketed to a character. They're treated no differently from an item on the ground and can be dropped at any time. Their GEs don't apply.
   - **The character's own loudness** (footsteps, voice) is preset in character data. It isn't the attribute's base value, because a base value can't be excluded by tag and would add to every action, gunfire included. Instead it's an innate infinite GE whose magnitudes come from character data, with each modifier requiring its action (`Action.Move`, `Action.Communicate.*`). The attribute's base stays 0.
@@ -943,10 +949,143 @@ Places where I'm unsure what you intended, or where a choice is still open.
 - **Resolved (2026-11-16): a current behavior that fails its own re-score** keeps running. Ending is left to the behavior's own finish conditions. Its low re-scored baseline means almost anything replaces it at the next occurrence.
 - **Re-score cost.** One extra purpose per layer per candidate per occurrence, plus fresh snapshots of the current behaviors' subjects. Small, but it adds to snapshot building on the game thread.
 - **The self weight default.** It's 0, unlike list weights at 1.0, so AI don't evaluate every one of their own actions. Confirm.
+- **Multitask formula** (see "Character attributes"): which attributes it reads beyond Intelligence and Fear, and its curve.
+- **Multitask dropping below what's running.** Fear spikes while an AI runs three behaviors with a Multitask now of 1. Recommended: nothing ends early. Running behaviors finish on their own conditions, and no new behavior starts until the count is under the Multitask value. The alternative is ending the lowest re-scored behaviors at the next occurrence.
+- **Layers exempt from Multitask.** Does gaze (the Attention layer) count, or can every AI always look at what it's reacting to?
 
 **Manager**
 - **Subsystem plus director actor** (as written), or a single director actor.
 - **Thread count**, and whether it scales with the host's core count.
+
+## Purpose refactor: implementation order (revision 4, planned 2026-11-17)
+
+The order in which to build revision 4 until the Purpose system's foundation is complete. Each phase depends only on the phases before it and ends in something testable in a map.
+- **Decide first:** open questions that change what gets built in that phase. Anything not listed there can be settled later without rework.
+- **Done when:** the check that closes the phase.
+
+The worked example (revision 4) is the acceptance test for the finished foundation.
+
+### Phase 1: The manager
+
+- [ ] `UPurposeManager` world subsystem, spawning the director actor that will host the groups' tasks components. It replaces the unported Lyra `ADirector_Level`.
+- [ ] Thread pool: N identical `FPurposeEvaluationThread`s, created on world begin play and stopped and joined on deinitialize. Delete `FEventThread`, `FActorThread` and `FCompanionThread`.
+- [ ] Performance #1: the load balancer stops dropping occurrences.
+- [ ] Performance #2: an `FEvent` wake replaces the fixed `tickTimer` sleep, and each wake drains the whole queue.
+- [ ] Purpose library: load the `UEventAsset`s through the asset manager and publish them as an immutable shared version. Workers hold the version they started with; threads stop referencing manager-owned arrays.
+- [ ] Registration: `UPurposeAbilityComponent` registers on `InitAbilityActorInfo` and unregisters on `EndPlay`. The manager assigns the `uint32` character id.
+- [ ] `RaiseOccurrence` as the single entry point. Routing is flat for now: every registered candidate. Re-enable the two commented-out `PurposeSystem::Occurrence` calls in `PurposeAbilityComponent.cpp` through it.
+
+**Decide first:** subsystem plus director actor, or a single director actor. Thread count, and whether it scales with cores.
+**Done when:** AI in a test map select and perform behaviors again. Threads sleep on the event when idle, and nothing is dropped under a burst of occurrences.
+
+### Phase 2: The occurrence record
+
+- [ ] `FOccurrenceEvent`: tag, context key, raise time, activation id, subjects as character ids plus weak pointers, values captured by value, and a weak `Cause`. Built only in `RaiseOccurrence`, held as `TSharedRef<const FOccurrenceEvent>`.
+- [ ] The queued job becomes the record plus the candidate and subject snapshots. `FContextData` stops being occurrence, result and behavior at once.
+- [ ] The running behavior is {record, purpose pointer, score}. There's no selection struct.
+- [ ] Remove the intent leaks: `SnapshotSubject` appending the current behavior to the Instigator and EventTarget snapshots, and `ActionPerformed` copying the behavior's subject map and context data.
+- [ ] Activation counter on `UPurposeAbilityComponent`. It replaces the 0.25 s `activatedAbilityTimeCache` timer.
+- [ ] Drain and merge by context key (steps 1–5 in "Repeats merge while queued"), with threads chosen by a hash of the context key.
+- [ ] Cause links: set when a behavior's action raises an occurrence, readable for the set time, pruned a margin later, and pinned while read.
+
+**Decide first:** where the chain time lives (per definition or one value). How a hit finds its fire record (the (character id, activation id) index).
+**Done when:** one action's record is shared by every candidate's job with no copies. Fast repeated taps merge to the newest. A cause chain of three links can be logged from the last record.
+
+### Phase 3: Definitions and tags
+
+- [ ] Declare the namespaces: `Action.*`, `Effect.*`, `State.*`, `Perception.*`, `Intent.*`, `Cooldown.*`. Set up `GameplayTagRedirects` for renames.
+- [ ] `UEventAsset` holds both kinds of definition. Intents hold conditions, behavior ability, scoring and self weight. Occurrences hold relevance list, retention, outcome fields and chain time.
+- [ ] Flatten relevance lists into a lookup when the library loads; the most specific entry wins.
+- [ ] Upper-bound pruning: `Potential` × relevance weight against the baseline. This is the `/// Refactor: Potential Score Evaluation` note. The baseline is 0 until phase 6.
+- [ ] The instigator becomes a candidate, scored with its self weight. This removes today's instigator skip.
+- [ ] Bind tag events for `State.*` tags that have a definition.
+
+**Decide first:** placing the current intents under activities (Cover: `Act` or `React`). The self weight default of 0.
+**Done when:** `Action.Fire` weights patrol at 0.1 and pruning skips purposes that can't win, with the result unchanged against a run without pruning.
+
+### Phase 4: Attributes and signatures
+
+- [ ] AO attribute set on the component: Health, Fear, Intelligence, Discipline, Morale, Boredom, Suppression, Engaged, LevelOfAlarm, Loudness and Multitask. Each gets an `FAttributeChunk` binding in `InitializeDataForOwner`.
+- [ ] Character defaults DataAsset (the TODO in `PurposeAbilityComponent.h`): attribute baselines, the innate loudness GE's magnitudes and granted purposes. Archetypes are profiles of this asset.
+- [ ] Multitask's innate GE with its `UGameplayModMagnitudeCalculation` (see "Character attributes").
+- [ ] Equipment GEs: in hand only. The fire GE uses source-aggregated stacking, `StackLimitCount` 1 and refresh on application. The suppressor is a multiply modifier requiring `Action.Fire`.
+- [ ] Capture in `RaiseOccurrence` through `GetFilteredAttributeValue` with the action's tag. Throwables read `GetStaticMagnitudeIfPossible` from their own GE.
+- [ ] Continuous actions: the re-raise interval on the action's definition, checked on rounds and footstep notifies, with the count carried in the record.
+- [ ] Custom effect context carrying character id, activation id and action tag. It needs a project `UAbilitySystemGlobals` subclass overriding `AllocGameplayEffectContext`, set in config.
+- [ ] Hits as a source, through `OnGameplayEffectAppliedDelegateToSelf`.
+- [ ] Thresholds: a GE grants `State.Suppressed` and `State.Downed`, which raise self occurrences.
+
+**Decide first:** which attributes an action captures (named per definition or a fixed set). Voice levels on the innate GE. Hits under the action re-raise rule or revision 3's gate. Full auto as one activation that fires internally.
+**Done when:** a suppressed rifle shot records a lower loudness than an unsuppressed one, and a step taken just before speech doesn't change the speech's loudness. Sustained fire raises at the interval, whatever the weapon's rate of fire.
+
+### Phase 5: History and relevance
+
+- [ ] Rewrite `FContextHistoryEntry` as a record reference plus the owner's own fields: behavior id, reaction and outcome. One entry per happening, with no more `AddToValue` refresh.
+- [ ] Pruning by the definition's retention and by the per-character cap on the component.
+- [ ] Relevance windows on the observer, per direction, with the end-of-window snapshot: position, velocity, State tags and attributes.
+- [ ] A minimal sight source that opens and closes windows and raises `Perception.Gained` / `Lost`. `Condition_SubjectVisibility`'s check is enough until the tactical grid exists.
+- [ ] The gated accessor on `FSubjectDataView`, the only way to read another subject's history and cause links.
+- [ ] Monitoring stats from "Monitoring history".
+
+**Decide first:** snapshot contents (all attributes or only those read). Hit and miss outcomes depend on shot calculation, which isn't designed yet, so leave the outcome field unset until it is.
+**Done when:** B can't read what A did while B didn't perceive A, and reads A's attributes from the snapshot after losing sight of A.
+
+### Phase 6: Evaluation and selection
+
+- [ ] Fix the resource bug: each task both requires and claims its resource (`///Bug: AI Tasks Resources Behavior`). Check existing behavior assets for tasks that now block each other.
+- [ ] Cache each behavior's resource union per purpose asset.
+- [ ] Snapshot rework: owned tags copied into a chunk, current behaviors per layer, how the candidate perceived the occurrence, Multitask.
+- [ ] Re-score the current behaviors against their own records (step 0b). That score is the baseline and the pruning floor.
+- [ ] Tag gate: expose the behavior ability's required, blocked and cooldown tags on `UBehavior_AI`, and compare them against the copied container.
+- [ ] Layered selection: best first, then the next that doesn't overlap, until resources run out, the Multitask limit is reached, or scores fall below the floor.
+- [ ] Same-behavior check by intent and reference. It replaces the event-target and ability-class guard.
+- [ ] Performance #4: one spec per purpose per actor with the purpose asset as `SourceObject`, so `GiveAbilityDuplicate` goes. Performance #5–#7 while in this code.
+
+**Decide first:** the Multitask formula and what happens when it drops below what's running. Whether layers are fixed by design or derived from tasks. Whether gaze counts against Multitask.
+**Done when:** an AI under fire moves to cover and calls it out at once, and a low-Multitask AI only moves. A bird landing pulls a bored guard off patrol but not a disciplined one.
+
+### Phase 7: Selected
+
+- [ ] Apply OnSelected before performing the ability.
+- [ ] Turn OnSelected numeric and timed changes into GEs (`GE_Engaged`). DataModifiers stay for history entries and references.
+- [ ] Write the intent entry `{intent, reference, phase, time, id}`, and record its id as the reaction on the occurrence's entry.
+- [ ] The Reference subject, plus virtual subjects (a DataMap carried beside the weak pointers in `FSubjectMap`).
+
+**Done when:** the first task of a behavior reads Context-targeted modifiers, and the occurrence's history entry links to the intent chosen in response.
+
+### Phase 8: Phases and finish
+
+- [ ] A "when" on `FContextAdjustmentFromAction`: OnActivate, OnSucceeded or OnFailed. Each entry can add or remove a State tag, apply a GE, or run a DataModifier.
+- [ ] Author `State.Position.Seeking` / `Moving` / `AtLocation` on the EQS and MoveTo tasks of the behavior assets. Remove the string-built tags in `AT_MoveTo`.
+- [ ] Track the State tags a behavior adds and remove them when it ends, however it ends.
+- [ ] Finish: close the intent entry with its `EAbilityPurposeFeedback` outcome, apply the cooldown GE, and raise a self occurrence for the freed layer. That replaces `SeekNewBehavior`.
+- [ ] Migrate the old tags and conditions ("Migration from the current tags"): Engaged count, `Contextual.Position.*`, `Moving` / `Seeking`.
+
+**Done when:** a cover behavior shows Seeking, Moving and AtLocation in `showdebug abilitysystem`, and an interrupted one leaves no State tags behind.
+
+### Phase 9: Self-reaction and communication
+
+- [ ] Self-reaction conditions that read the candidate's own current behaviors and nothing else.
+- [ ] `AT_Communicate`: Verbal or Gesture, content as intent plus reference, the level within the squad grade, and the cue executed by the task.
+- [ ] Novelty conditions on the owner's history ("already said this about this reference").
+
+**Done when:** "Moving!" plays on the Voice layer while the AI runs to cover, once per reference.
+
+### Phase 10: Groups and providers
+
+- [ ] `UPurposeGroup` (recursive, `IDataMapInterface`), with its root on the manager and a tasks component per group on the director actor.
+- [ ] Top-down routing culled by bounds against reach. This replaces phase 1's flat routing and Performance #3.
+- [ ] Groups as candidates, which needs the candidate type generalized. Slots as raw resource bits, free-slot picking, and performer choice among the members who perceived the occurrence.
+- [ ] Orders as heard `Action.Communicate.*` occurrences, weighed by Discipline against Fear.
+- [ ] `UPurposeProviderComponent` on placed actors, registering on stream in and out.
+- [ ] Equipment subject and latent actions: the grenade's throw and detonation records, linked by `Cause`.
+
+**Decide first:** who performs a squad task, how the leader is chosen, what a group's snapshot holds, and the shared candidate interface.
+**Done when:** the revision 4 worked example plays out in a test map, from the bored guard and the bird through the grenade to F learning through communication.
+
+### After the foundation
+
+Built on top, not part of it: the tactical grid and spatial perception, delegated decision-making, host-migration snapshots, and LOD for distant AI.
 
 ## Design: spatial perception (proposed)
 

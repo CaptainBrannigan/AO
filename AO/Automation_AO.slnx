@@ -26,6 +26,7 @@
     <Project Path="../../Epic Games/UnrealEngine/Engine/Source/Programs/UnrealBuildTool/UnrealBuildTool.csproj" />
   </Folder>
   <Folder Name="/Tests/">
+    <Project Path="../../Epic Games/UnrealEngine/Engine/Source/Programs/AutomationTool.Tests/AutomationTool.Tests.csproj" />
     <Project Path="../../Epic Games/UnrealEngine/Engine/Source/Programs/Shared/EpicGames.Build.Tests/EpicGames.Build.Tests.csproj" />
     <Project Path="../../Epic Games/UnrealEngine/Engine/Source/Programs/Shared/EpicGames.BuildGraph.Tests/EpicGames.BuildGraph.Tests.csproj" />
     <Project Path="../../Epic Games/UnrealEngine/Engine/Source/Programs/Shared/EpicGames.Core.Tests/EpicGames.Core.Tests.csproj" />
@@ -42,6 +43,7 @@
   <Project Path="../../Epic Games/UnrealEngine/Engine/Plugins/VirtualProduction/ICVFXTesting/Build/Scripts/ICVFX.Automation.csproj" />
   <Project Path="../../Epic Games/UnrealEngine/Engine/Source/Programs/AutomationTool/Android/Android.Automation.csproj" />
   <Project Path="../../Epic Games/UnrealEngine/Engine/Source/Programs/AutomationTool/Apple/Apple.Automation.csproj" />
+  <Project Path="../../Epic Games/UnrealEngine/Engine/Source/Programs/AutomationTool/AutomationTool.csproj" />
   <Project Path="../../Epic Games/UnrealEngine/Engine/Source/Programs/AutomationTool/AutomationUtils/AutomationUtils.Automation.csproj" />
   <Project Path="../../Epic Games/UnrealEngine/Engine/Source/Programs/AutomationTool/BuildGraph/BuildGraph.Automation.csproj" />
   <Project Path="../../Epic Games/UnrealEngine/Engine/Source/Programs/AutomationTool/CookedEditor/CookedEditor.Automation.csproj" />
