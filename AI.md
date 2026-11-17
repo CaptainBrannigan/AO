@@ -42,7 +42,15 @@ Destruction and other world changes should raise occurrences too: a building bre
 
 ## Design: occurrence to reaction with GAS (proposed)
 
-This section describes how an occurrence should travel from "something happened" to an AI reacting. GAS covers what it already does well: state, quantities, timed effects, gating, task resources, cooldowns and cosmetic replication. The Purpose system keeps what GAS has no answer to: scoring, "how long ago", relevance, and subjects. Proposed 2026-10-28 and revised the same day after review (revision 1), on 2026-10-29 (revision 2) and on 2026-11-02 (revision 3); none of it is implemented yet. The sections below describe revision 3. Earlier revisions survive only in their worked examples.
+This section describes how an occurrence should travel from "something happened" to an AI reacting. GAS covers what it already does well: state, quantities, timed effects, gating, task resources, cooldowns and cosmetic replication. The Purpose system keeps what GAS has no answer to: scoring, "how long ago", relevance, and subjects. Proposed 2026-10-28 and revised the same day after review (revision 1), on 2026-10-29 (revision 2), on 2026-11-02 (revision 3) and on 2026-11-14 (revision 4); none of it is implemented yet. The sections below describe revision 4. Earlier revisions survive only in their worked examples.
+
+**Revision 4 in short:**
+- A manager subsystem owns the threads, the purpose library and registration.
+- Occurrences are immutable and shared, built in one place, and point to the occurrence that caused them.
+- There is no Purpose settings table. Data about a happening or an intent lives on its definition in the library, and signatures come from attributes on the equipment or actor that performed the action.
+- Each occurrence definition has a weighted list of intent tags in place of the relevance matrix.
+- Intent tags are structured by activity, and Action tags name the verb.
+- Behavior changes only through new occurrences.
 
 The worked example near the end is the litmus test for design changes. The baseline copy stays as first written. Each revision of the design adds its own copy of the example showing what changed.
 
@@ -57,6 +65,8 @@ The worked example near the end is the litmus test for design changes. The basel
 - **Each character records only itself.** Nobody writes another character's outcomes into their own history. To compare itself with someone, an AI reads that someone's history through relevance (see "One history per character").
 - **Self-knowledge is read, never sent.** An AI's own intent and reference are read by its self-reaction conditions from its own snapshot. No occurrence carries them, and no condition can point at another character's current behavior (see "Self-reaction").
 - **One definition per thing.** An occurrence's tag is the identity tag of what was performed (the task or the effect), not a second tag describing it. Phases are authored on the task that causes them, in the details panel, not built in code.
+- **Data lives on the definition it describes (revision 4).** Everything about a happening (its relevance list, retention, outcome fields) lives on its definition in the purpose library, and everything about an intent on the intent's definition. No side table in settings duplicates or overrides them. Values that depend on the moment, such as how loud a shot was, come from attributes on whatever performed it, read when it happens.
+- **Behavior changes only through occurrences (revision 4).** Nothing ticks "should I keep doing this", and no score decays on a timer. A running behavior is replaced only when a new occurrence produces a better purpose: an ad comes on, a bird lands nearby. Every change a player sees then has a cause they could have seen. Individuality comes from attributes and GEs: a guard who bores easily accumulates boredom on patrol and is pulled away by a smaller occurrence than a disciplined one, but it still takes an occurrence.
 - **Each kind of fact has one home.** Tags say what kind, attributes say how much, history says when, and subjects say who and where. `Contextual.Combat.Engaged.1–5` broke this by storing a count as a category.
 - **Use GAS where it already solves the problem; keep the Purpose system where GAS has no equivalent.** GAS has no utility scoring, no "how long ago", no relevance, and no subjects beyond source and target.
 
@@ -65,6 +75,17 @@ The worked example near the end is the litmus test for design changes. The basel
 Top-level namespaces, split by what a tag identifies, how long it lasts, and who can read it. These replace `Contextual.*`.
 
 There is no `Event.*` namespace. "Event tag" is the role a tag plays on an occurrence: it is the Action, Effect or Perception tag of whatever happened.
+
+**Intent vs. Action (revision 4).** `Intent.*` names what a behavior seeks; it's what selection chooses. `Action.*`, `Effect.*`, `State.*` and `Perception.*` name what happened; they're what intents are scored against. An intent is never an action itself.
+
+**How tags are structured (revision 4).** Each level answers one question, so a weight on any level reads unambiguously:
+- **`Action.<Verb>[.<Detail>]`:** what the actor did, not what it did it with. `Action.Fire`, `Action.Throw`, `Action.Place`, `Action.Move`. A rifle and a pistol both perform `Action.Fire`. Their differences come from the equipment's attributes, carried by the occurrence (see "Equipment and latent actions").
+- **`Intent.<Activity>.<Behavior>[.<Scope>[.<Subvariant>]]`:**
+  - **Activity:** the broad kind of behavior. Starting set: `Investigate`, `Act`, and `React` (in this context a form of inaction: holding, freezing, staying down). More are added as behaviors show a better substructure. The set isn't fixed in code, but renames are costly once assets reference the tags; `GameplayTagRedirects` keeps renamed tags resolving.
+  - **Behavior:** what the AI does, not why or what results. A result such as raised suspicion is a `State.*` tag the behavior applies, not part of the intent's name.
+  - **Scope:** only where a behavior exists at more than one scope, as a variant. Scope isn't a separate axis, because a behavior that needs a squad can't exist for an individual: `Intent.Act.BattleDrill.Squad.BoundingOverwatch` is only ever offered to squad candidates.
+  - At most four levels below `Intent`.
+- **Activity comes first** because it's the axis occurrence definitions weight most often: gunfire weights `Intent.React` high and `Intent.Investigate` lower, whatever the scope.
 
 | Namespace | Identifies | Lifetime | Lives on | Readable by others |
 |---|---|---|---|---|
@@ -78,7 +99,7 @@ There is no `Event.*` namespace. "Event tag" is the role a tag plays on an occur
 
 Examples:
 - **Action:**
-  - `Action.Move`, `Action.Face`, `Action.Weapon.Fire`.
+  - `Action.Move`, `Action.Face`, `Action.Fire`, `Action.Throw`, `Action.Place`. Revision 3 used `Action.Weapon.Fire`; earlier worked examples keep that name.
   - `Action.Query.<subject>`: asking the world, such as `Action.Query.Position` for the EQS task. Named for what the AI does, not the tool: a position query answered from the tactical grid instead of EQS keeps the same tag. A query is thought, not a visible act, so its signature has no reach and only its owner receives it, mainly for self-reactions.
   - `Action.Request.<nature>`: asking others, such as `Action.Request.Support`. It's communicated, so others can perceive it.
   - `Action.Communicate.Verbal.Loud` / `Normal` / `Quiet` / `Silent`, and `Action.Communicate.Gesture`. Each level has its own signature, so a loose squad shouting is heard from farther away than special forces speaking quietly (see "Squad coordination").
@@ -90,17 +111,20 @@ Examples:
   - `State.Combat.Engaged` / `UnderFire`.
   - `State.Suppressed`: granted by a GE when the Suppression attribute crosses its threshold (see "Thresholds as State tags").
   - `State.Downed`. Downed is a mechanic with its own rules, so it's a state. How hurt someone is is a number, read from the Health attribute by a condition.
-- **Intent:** `Intent.Cover`, `Flank`, `Overwatch`, `Advance`, `Fallback`, `Regroup`, `Investigate`, `Patrol`, `Ambush`, `Suppress`, `Inform`, `AwaitOrders`.
+- **Intent:** the behaviors so far are Cover, Flank, Overwatch, Advance, Fallback, Regroup, Investigate, Patrol, Ambush, Suppress, Inform and AwaitOrders. They still need placing under activities (`Intent.Investigate.*`, `Intent.Act.*`, `Intent.React.*`); until then the text below uses the short form `Intent.Cover`.
 
 ### Health and other observable numbers
 
 Two paths, raised in review:
-- **Visible wounds.** Perception reads what is presented. Wound decals work with the textureless color-region art.
+- **Visible wounds.** Perception reads what is presented. Decals don't break the textureless character material, since a decal brings its own material, which can itself be textureless. On moving, skinned characters, though, wounds drawn by the character material are the better fit (see Rendering.md → "Wounds and impact marks").
 - **Attributes readable directly**, for ease and computation (Health, velocity).
 
-**Recommendation:** for the AI, these cost the same. An AI doesn't need to look at a decal; it reads the Health attribute while it perceives the subject, which is what it would have seen. Each attribute is marked observable or private in the Purpose settings (see "Configuration"):
-- **Observable:** Health, velocity. Readable by others while they currently perceive the owner.
-- **Private:** Fear, Intelligence, Morale, Suppression. Never readable by others.
+**Recommendation:** for the AI, these cost the same. An AI doesn't need to look at a decal; it reads the Health attribute while it perceives the subject, which is what it would have seen.
+
+**No per-attribute visibility (decided 2026-11-16).** Revision 3 marked each attribute observable or private. Revision 4 drops the mark and relies on the perception mechanic already in place:
+- While B perceives A, B can read A's attributes.
+- When B stops perceiving A, B keeps a snapshot of A's attributes from the end of that window, beside the last known position (see "Relevance-gated history"). Conditions read the snapshot until a new window opens.
+- Trying to control which data is available beyond that adds more machinery than it's worth. Whether an AI should weigh an enemy's Fear or Intelligence is left to the conditions that are written.
 
 Whether to draw wounds then becomes a fairness and art decision, not an AI one. If AI can read an enemy's health, players should be able to see it too, or the AI knows something players can't.
 
@@ -116,7 +140,9 @@ Whether to draw wounds then becomes a fairness and art decision, not an AI one. 
 | Places and references | Cover point, last known position | Subjects (below) | Conditions address a place the same way as an actor |
 | Don't repeat | No re-flank for 10 s | A cooldown GE, plus the behavior's blocked tags | A pre-filter that needs no condition |
 | Cosmetic reaction | Voice line, hand signal | GameplayCue | Replicates to clients for free |
-| Static tuning | How loud a shot is, which attributes are observable | Purpose settings | One place, readable from any thread |
+| Data about a happening or an intent | Relevance list, retention, self weight, outcome fields | Its definition in the purpose library | One location; the library is published read-only to the workers |
+| How it was performed | How loud the shot was, how visible | The performer's attributes, evaluated for the action's tag and copied into the occurrence when raised. Equipment changes them through its GEs | Equipping and unequipping is GE application and removal |
+| The happening itself | Who, what, where, why (its cause) | The occurrence: immutable, shared, referenced by history | Built once, never copied |
 
 Each attribute has one chunk: `FAttributeChunk`, keyed by a `Data.*` tag and bound to its `FGameplayAttribute` in `InitializeDataForOwner`. That's the tag pairing attributes don't have on their own. Attribute chunks are copied at snapshot like any other chunk. EngagedCombatants, Morale and LevelOfAlarm become attribute chunks; Fear and Intelligence are new ones.
 
@@ -137,10 +163,11 @@ Each entry carries the context of what happened, not just its tag:
   - **Tag:** the entry's own `Action.*`, `Effect.*` or `Perception.*` tag.
   - **Instigator:** the character id of whoever caused it. Effects received always record it, because the instigator is how the owner finds that character's history to read through relevance.
   - **Target:** the character id it happened to.
-  - **Cause, for effects:** the instigating action's tag from the effect context, such as `Action.Weapon.Fire` or `Action.Weapon.Throw`. Gunfire and a grenade from the same enemy are then different entries and different occurrences.
+  - **Cause, for effects:** the instigating action's tag from the effect context, such as `Action.Fire` or `Action.Throw`. Gunfire and a grenade from the same enemy are then different entries and different occurrences.
   - **Reference, for actions:** what the action was relative to.
 - **Entries with the same context fields form one context.** A context is what occurrences are identified by and merged on (see "Occurrence identity and repeats"); a different context always raises a new occurrence.
-- **Notation used below:** `Effect.Damage ← 37 via Action.Weapon.Fire` means damage instigated by character 37 through that action. The target is the entry's owner unless stated.
+- **Notation used below:** `Effect.Damage ← 37 via Action.Fire` means damage instigated by character 37 through that action. The target is the entry's owner unless stated.
+- **Entries reference the occurrence instead of copying it (revision 4).** The context fields, time and activation are already on the occurrence (see "Occurrences: one record, shared"), so an entry holds a shared reference to it plus what's the owner's own: behavior, reaction and outcome. Every character that recorded the same happening points to the same record.
 - **Today** `FContextHistoryEntry` is `{contextualTag, timeOfContext}`, and `AddToValue` (`ContextualHistory.h`) refreshes the time of an existing tag instead of adding an entry, so hits from two shooters collapse into one.
 
 | Field | Meaning |
@@ -164,9 +191,9 @@ Example: P shoots A twice; A takes cover from P (intent #12), then fires at P si
 
 | A's entries | Time | Outcome | Reaction |
 |---|---|---|---|
-| `Effect.Damage ← P via Action.Weapon.Fire` | t0 | | #12 (cover from P) |
-| `Effect.Damage ← P via Action.Weapon.Fire` | t0 + 0.1 s | | |
-| `Action.Weapon.Fire`, at P, by #13, ×6 | t3 … t5 | 1 hit, 5 misses | #13 (suppress P) on the first |
+| `Effect.Damage ← P via Action.Fire` | t0 | | #12 (cover from P) |
+| `Effect.Damage ← P via Action.Fire` | t0 + 0.1 s | | |
+| `Action.Fire`, at P, by #13, ×6 | t3 … t5 | 1 hit, 5 misses | #13 (suppress P) on the first |
 
 **Comparing yourself with others uses relevance, not copies.** A's history never records P's numbers. If A perceives P, A reads P's history through the gated accessor (see "Relevance-gated history"):
 - A's fire entries at P show 1 of 6 landed.
@@ -175,7 +202,9 @@ Example: P shoots A twice; A takes cover from P (intent #12), then fires at P si
 
 If A didn't perceive P while P fired, A has only its own entries: hit twice by P.
 
-**Entries stay small.** Outcome fields are listed per tag in the Purpose settings, so only the outcomes someone uses are recorded. Entries are pruned by age and by a per-character cap, oldest first.
+**Entries stay small.** Outcome fields are listed on each occurrence definition, so only the outcomes someone uses are recorded. Entries are pruned by age and by a per-character cap, oldest first:
+- **Age:** each entry's retention comes from the definition of what happened. Gunfire might be remembered for 60 s and a footstep for 5 s.
+- **Cap:** a memory budget, not data about any happening, so it lives on the character's component and can differ by archetype.
 
 #### Monitoring history
 
@@ -195,12 +224,13 @@ Per-happening entries are the simple starting point, not a settled format. Track
 **Rule:** observer B can read subject A's history only for the time windows in which B perceived A. If A leaves all of B's perception and later comes back, whatever A did in between is invisible to B. A's current State tags and observable attributes are readable only while B perceives A now.
 
 - **Per direction.** A perceiving B and B perceiving A are separate records. Stealth depends on the asymmetry: A can watch B without B knowing.
-- **Storage.** On the observer, keyed by subject: a list of windows `{start, end}`, plus what the observer saw at the end of the latest window: position, velocity, State tags. Pruned by age and count. Only pairs that ever perceived each other have one.
+- **Storage.** On the observer, keyed by subject: a list of windows `{start, end}`, plus what the observer saw at the end of the latest window: position, velocity, State tags, and a snapshot of the subject's attributes (revision 4). Pruned by age and count. Only pairs that ever perceived each other have one.
 - **Occurrences.** Opening a window raises `Perception.Gained` for the observer; closing one raises `Perception.Lost`.
 - **Last known position** is the position at the end of the latest window, exposed as a virtual subject (see "Subjects").
 - **Intent stays private.** Even inside a window, B can't read A's intent entries. B can see A start moving, but not why or to where. A's intent reaches B only when A communicates it. B then records what it heard in its own history, so B never reads A's private entries.
 - **Relevance records are private too.** "Have I been spotted?" is never answered by reading the enemy's record about me. Each AI estimates it from what it can perceive, more or less accurately depending on Intelligence (see "Character attributes").
 - **Hearing and feeling.** Sight opens and closes windows. A sound or a hit is recorded as an entry in the listener's own history: what was heard and roughly where. A heard gunshot doesn't reveal the shooter's history.
+- **Cause chains are gated the same way (revision 4).** Every occurrence points to the occurrence that caused it (see "Occurrences: one record, shared"). The chain is the objective truth, so an observer may follow a link only if that occurrence is in its own history (it perceived it) or was communicated to its group. Other links read as "caused by something I don't know". That's how F, who never knew A, can learn that A was shot first: someone who saw it has to tell F.
 - **Cost.** A's history is copied into an occurrence's snapshot once and shared by every candidate. Each candidate brings its own windows. The filtering happens when a condition reads another subject's history, through a gated accessor on `FSubjectDataView` beside `Primary`/`Secondary`. If that accessor is the only way to read another subject's entries, conditions can't bypass the rule by accident, and shared snapshots stay shared.
 
 ### Subjects for places and references
@@ -257,7 +287,7 @@ Communication is a behavior like any other, chosen by scoring, on the Voice laye
 Revision 2 raised a second, private occurrence when a behavior was selected. Revision 3 drops it: the AI already receives an occurrence for every action its behavior performs, so that is what it reacts to.
 
 1. **The instigator is a candidate for its own actions.** When A's cover behavior starts moving, the `Action.Move` occurrence reaches A like anyone else. Today `PurposeEvaluationThread.cpp` skips the instigator as a candidate; that skip becomes the self weight.
-2. **Only self-reaction purposes can score it.** The relevance matrix has a self weight, which is 0 for every purpose not marked as a self-reaction. Those purposes are skipped by the same pruning as any other, so the skip can't change the result.
+2. **Only self-reaction purposes can score it.** Each purpose has a self weight on its own definition. It defaults to 0, unlike relevance-list weights, which default to 1.0; marking a purpose as a self-reaction sets it. Purposes at 0 are skipped by the same pruning as any other, so the skip can't change the result.
 3. **Self-reaction conditions read the candidate's own current behavior.** Its intent and reference are in the Candidate snapshot already. These conditions have no subject setting, so they can't be pointed at the instigator or target. Nothing about the intent goes into the occurrence.
 4. **Remove today's leaks.** These pass the current behavior to other AI:
    - `SnapshotSubject` appends the current behavior to the Instigator and EventTarget snapshots (`PurposeEvaluationThread.cpp`, `MakeOccurrence`).
@@ -272,7 +302,7 @@ The same mechanism covers other "while I'm doing that" reactions, such as raisin
 
 One occurrence per activation (see "Occurrence identity and repeats") means later hits in a burst update history without being evaluated. A reaction to the fifth hit pushing Suppression past the pinned level has to come from somewhere else:
 - **A GE grants the State tag** when the attribute crosses its threshold, such as `State.Suppressed` or `State.Downed`.
-- **Gaining or losing a State tag raises a self occurrence**, delivered only to the owner. The ASC's `RegisterGameplayTagEvent` reports the change; the Purpose settings list which State tags raise occurrences.
+- **Gaining or losing a State tag raises a self occurrence**, delivered only to the owner. The ASC's `RegisterGameplayTagEvent` reports the change. A State tag raises occurrences if it has a definition in the purpose library; there's no separate list. The manager binds tag events for those definitions when the library loads.
 - **Others don't receive it.** They see the State tag only while they perceive the owner, through their own occurrences.
 
 The freed-layer occurrence when a behavior ends (see "Finish") is the same kind of self occurrence.
@@ -366,7 +396,7 @@ Grade is also a speed setting: quiet signals and short commands land sooner than
 - its DataMap: level (`Group.Squad`, `Group.Platoon`...), leader, bounds,
 - its tasks component.
 
-The root belongs to the director (a world subsystem or a single director actor). The logic is written once, and each level is its own object.
+The root belongs to the manager (see "The manager"). The logic is written once, and each level is its own object.
 
 This beats one manager holding tree data. Every node has to be addressable as a subject (a weak UObject in `FSubjectMap`) and own a tasks component, so the nodes would end up as objects anyway. Tasks components are actor components, so they all live on the director actor, one per group, created as groups form.
 
@@ -404,7 +434,7 @@ This replaces Performance #3's spatial-filtering fix.
 
 Revision 2 coalesced repeats inside a time window per tag. Revision 3 has no windows: repeats are recognized by what caused them.
 
-**One occurrence per activation.**
+**One occurrence per activation.** In revision 4 every happening builds an occurrence record (see "Occurrences: one record, shared"); these rules decide which records are queued for evaluation. The rest are only recorded in history.
 - **The activation counter.** `UPurposeAbilityComponent` keeps a count that it increments whenever one of its abilities activates. Together with the character id, that count identifies one activation. It lives on the component because it has to work under every instancing policy:
 
   | Policy | What exists | So a counter on the ability… |
@@ -413,7 +443,15 @@ Revision 2 coalesced repeats inside a time window per tag. Revision 3 has no win
   | InstancedPerActor | One object per actor, created when granted and reused | Works, but must be reset by hand |
   | InstancedPerExecution | A new object per activation | Always reads 1 |
 
-- **Actions.** The action occurrence carries the activation id. A full-auto burst is one activation that keeps firing internally, so it raises one occurrence per trigger pull, not per round.
+- **Actions.** The action occurrence carries the activation id.
+- **Continuous actions re-raise while active (decided 2026-11-16).** Full-auto fire, footsteps and other actions that last a while raise repeat occurrences for as long as they're active, all under one activation id.
+  - **The interval lives on the action's definition, as a time (decided 2026-11-17).** `Action.Fire` has one re-raise interval for every weapon, so a high-rate SMG raises no more occurrences than a rifle.
+  - **It's checked on physical events, not by a timer.** On each round fired, or each footstep notify, the action raises a repeat if the interval has passed since its last one. When the action stops, nothing is left running.
+  - **The record carries the count.** Each repeat records how many rounds (or steps) happened since the previous one, so rounds are still counted for hit ratios without raising more occurrences. This answers late listeners: someone who comes into range mid-burst gets the next one.
+  - **Every repeat reaches every candidate.** Routing doesn't skip candidates that already saw the activation, because that would be an occurrence gating itself.
+  - **Merging absorbs backlog.** Repeats share a context key, so a repeat still queued when the next arrives is superseded (see "Repeats merge while queued").
+  - **Novelty is a condition.** A heavily weighted condition scores a repeat low when the candidate's last entry in this context is only x seconds old. It can also read whether the candidate already reacted to this activation (the Reaction field). A late listener has no entry, so it scores normally.
+  - **Cost:** each repeat is evaluated by every candidate in reach. The re-scored baseline (see "Evaluation") prunes most purposes for candidates already reacting. Measure under sustained fire.
 - **Hits.** The shooter's activation id travels in the effect context (below). Every hit adds an entry. Then:
   - **Same activation as the latest entry** in that context: no occurrence.
   - **New activation** (a new burst, a semi-auto shot): raise an occurrence.
@@ -431,17 +469,22 @@ Revision 2 coalesced repeats inside a time window per tag. Revision 3 has no win
 **Repeats merge while queued.** Distinct activations can still queue up close together, such as fast semi-auto taps. The newest occurrence of a context supersedes older ones still in the queue, and there is no follow-up check after evaluation.
 - `TQueue` can't be searched or edited, and snapshots must be taken on the game thread. So a repeat raises a fresh occurrence with fresh snapshots, and the older one is skipped.
 - **The evaluation thread decides, by timestamp.** Each occurrence carries the time it was raised and its context key (the history entry's context fields). On each wake the thread drains its whole queue, the same drain as Performance #2. It keeps only the newest occurrence per context key and evaluates those. The map is local to that drain, so there are no counters to reset and nothing shared with the game thread.
+  1. **Drain:** dequeue until the queue is empty. Dequeuing removes items from the real queue, so nothing popped is evaluated twice.
+  2. **Merge:** each popped occurrence goes into a local map keyed by context key. A newer one replaces the older one, which is released; it's freed if nothing else holds it.
+  3. **Evaluate** each occurrence left in the map, oldest raise time first. The newest repeat is evaluated in place of the older ones. No count of merged repeats is needed, because the history entries recorded at raise time already hold it.
+  4. **Arrivals during the drain or evaluation:** the queue is a lock-free single-consumer `TQueue`, so the game thread can keep enqueuing. Whatever arrives after the queue was found empty waits for the next drain, and enqueuing triggers the wake event. If that repeat is redundant with what was just evaluated, the novelty condition scores it low.
+  5. **Batch size:** if a long drain delays the last items too much, cap it at N items. Merging still works within each batch.
 - **Repeats of a context must reach the same thread.** The load balancer picks a thread by queue depth. It would also need to route by a hash of the context key, at some cost to balance (a noted concern; see "Open questions (revision 3)").
 - The newest occurrence already has the latest history, because the game thread added the entry before raising it.
 - **How many happened since the last reaction** comes from the entries: those in the context newer than the latest one with a reaction. It doesn't come from counting merged occurrences, because that would miss repeats that never raised one, such as the later hits of a burst. Shots fired at the owner that missed aren't in the owner's entries at all. Those are in the shooter's fire entries, readable only if the owner perceived the shooter.
 
-**Continuation, not restart.** When the winning purpose has the same intent and the same reference as a current behavior, it continues: the reaction is recorded and the behavior keeps running. A new reference starts a new behavior.
+**A yes for what's already running isn't a new behavior.** Evaluation only answers yes or no to a new behavior; a no keeps the current one running until some later occurrence produces a yes. There's no separate "continue" decision (revision 4). When the yes has the same intent and the same reference as a current behavior, the reaction is recorded and the behavior keeps running instead of restarting. A new reference starts a new behavior.
 - Today's guard (`PurposeEvaluationThread.cpp`) skips a winner whose event target and behavior ability class match the current behavior. It ignores the instigator on purpose, because conditions couldn't yet tell "cover from P" from "cover from Q". With cover conditions they can, so the guard is replaced by the intent-and-reference comparison. A `/// Refactor: Identical Behaviors Time-Gated Occurrences` note in the code marks it.
 
 ### Where purposes live
 
 `FPurpose` is already a struct, so it can live in more than one vessel:
-- **Library:** `UEventAsset` (a DataAsset) for purposes every AI may consider.
+- **Library:** `UEventAsset` (a DataAsset) for purposes every AI may consider. In revision 4 one asset class holds both kinds of definition: intents (conditions, behavior ability, scoring, self weight) and occurrences (relevance list, retention, outcome fields). One class rather than two keeps every input to selection in one system.
 - **World providers:** a `UPurposeProviderComponent` on placed actors, for example a radio with purposes describing how to use it.
   - It holds `FPurpose` entries (instanced conditions per placed actor) or asset references plus overrides.
   - It implements `IDataMapInterface`, so the radio is the subject those purposes read.
@@ -464,35 +507,108 @@ Attributes give AI their own character without hardcoded archetype paths.
     Prefer one condition whose tolerance comes from an Intelligence curve over two purposes, so precision doesn't multiply purposes.
   - **Coordination.** Leading, awaiting orders and relaying information are purposes gated by Intelligence.
 - **Discipline** weighs a heard order against Fear. A disciplined AI follows the order even under fire; an undisciplined one keeps reacting on its own. It's part of what sets a squad's grade (see "Squad coordination").
+- **Focus, boredom and distraction (revision 4)** are attributes too, changed by GEs, never by a decaying score. A guard who bores easily gains boredom faster on patrol. When the next occurrence re-scores the patrol (see "Evaluation"), its conditions read Boredom and score lower, and distraction purposes read it too. So a smaller occurrence pulls that guard away than a disciplined one. The change still waits for an occurrence (see "Principles").
+- **Equipment carries GEs, not attributes (decided 2026-11-16).** Each item can carry different GEs or magnitudes, so no two weapons need be the same. There's no attribute set and no ASC on equipment.
+  - **Only what's in hand is equipped.** Holstered or slung items are world items that happen to be socketed to a character. They're treated no differently from an item on the ground and can be dropped at any time. Their GEs don't apply.
+  - **The character's own loudness** (footsteps, voice) is preset in character data. It isn't the attribute's base value, because a base value can't be excluded by tag and would add to every action, gunfire included. Instead it's an innate infinite GE whose magnitudes come from character data, with each modifier requiring its action (`Action.Move`, `Action.Communicate.*`). The attribute's base stays 0.
+  - **Action GEs are applied when the action happens.** Firing applies the weapon's fire GE, whose modifier requires `Action.Fire`, with a short duration so it falls away on its own.
+    - **No stacking duration:** `StackingType` aggregated by source, `StackLimitCount` 1, and `StackDurationRefreshPolicy` refreshing on application. Sustained fire keeps one instance and refreshes it, instead of extending it.
+    - A suppressor is an infinite GE while attached, with a multiply modifier that also requires `Action.Fire`.
+    - So a shot's loudness is the weapon's GE times the suppressor, and the character's innate loudness doesn't apply.
+  - **Throwables don't apply their GE to the owner.** A grenade's loudness GE stays on the grenade. When its detonation is raised, the magnitude is read from the GE itself: `FGameplayEffectModifierMagnitude::GetStaticMagnitudeIfPossible` returns a scalable-float magnitude with no ASC. Attribute-based and custom-calculation magnitudes would need a spec with captures, so throwables should use scalable floats or SetByCaller. The value is captured into the record on the game thread, and conditions read it from there, never from the GE object.
+  - **The action tells a gunshot from a footstep.** A single Loudness attribute on the character serves every action. Each modifier carries tag requirements, which `FGameplayModifierInfo` already has (`SourceTags` / `TargetTags`). A rifle's or suppressor's modifier requires `Action.Fire`, and boots require `Action.Move`.
+  - **Capturing it:** when an occurrence is raised, `RaiseOccurrence` reads the attribute with the action's tag through `UAbilitySystemComponent::GetFilteredAttributeValue`. That aggregates only the modifiers whose requirements the tag meets, and the result is copied into the record. It uses static tag containers internally, so it's game-thread only; that's where occurrences are raised anyway.
 - **Archetypes are attribute profiles.** The character defaults DataAsset (TODO in `PurposeAbilityComponent.h`) carries attribute baselines, and optionally the set of purposes granted. An archetype is never a code path.
 
-### Configuration: occurrence signatures and the relevance matrix
+### The manager (revision 4)
 
-**Gameplay tags carry no data.** A tag has a name, a developer comment and the source it was declared in. `meta=(Categories="...")` on a UPROPERTY only filters the tag picker. `FGameplayTagTableRow` can be subclassed for tag DataTables, but the tag manager ignores extra fields. So "data about a tag" always means a table keyed by tag.
+Today nothing creates the evaluation threads, fills their caches or raises occurrences. The Lyra `ADirector_Level` that did wasn't ported, and both `PurposeSystem::Occurrence` calls in `PurposeAbilityComponent.cpp` are commented out. The manager replaces the director.
 
-**Recommendation:** a `UDeveloperSettings` subclass (`UPurposeSettings`).
-- It appears in Project Settings, is stored in config, is loaded at startup without asset loading, and is read with `GetDefault<UPurposeSettings>()`. Lyra's developer settings use the same pattern.
-- It's safe to read from the evaluation threads as long as nothing writes to it during play. Editing settings during PIE would race the workers, so copy what the workers need into an immutable struct when play begins.
-- If the tables grow large or designers want them as assets, the settings can reference a DataTable or DataAsset loaded at startup instead. The lookup stays the same.
+- **A world subsystem**, with a director actor it spawns to host the groups' `UGameplayTasksComponent`s, since those are actor components (see "Command hierarchy and occurrence routing").
+- **Thread pool:** N identical evaluation threads, created on world begin play and stopped and joined on deinitialize. The empty `FEventThread` / `FActorThread` / `FCompanionThread` subclasses go. It includes Performance #1 (the load-balancer fix) and #2 (an `FEvent` wake that drains the whole queue).
+- **Purpose library:** loads the `UEventAsset`s and publishes them as an immutable shared version. Workers hold the version they started with, so nothing they read changes under them. Threads no longer hold references to manager-owned arrays.
+- **Registration:** `UPurposeAbilityComponent`s register on `InitAbilityActorInfo` and unregister on `EndPlay`, instead of being found by a scan. Registering assigns the character id (see "Reference identity"). Purpose providers register the same way.
+- **One entry point, `RaiseOccurrence`.** It's the only place an occurrence is built (see "Occurrences: one record, shared"). It routes the occurrence through the hierarchy and queues it. AI never hold a reference to the manager's internals or to their own group.
+- **State tag bindings:** when the library loads, the manager binds tag events for every `State.*` tag that has a definition (see "Thresholds as State tags").
 
-It holds:
-- **Occurrence signatures:** per Action or Effect tag, how loud it is (audible radius), how visible, and a maximum relevance radius.
-  - The maximum radius is only a performance cull for finding candidates.
-  - Whether a candidate heard the occurrence is a condition: loudness against distance and the candidate's hearing.
-  - Each `Action.Communicate.Verbal.*` level has its own row.
-- **The relevance matrix** (see "Evaluation"), including the self weights.
-- **Observable attributes.**
-- **History outcome fields** recorded per tag, such as hits landed for fire (see "One history per character").
-- **State tags that raise self occurrences** when gained or lost (see "Thresholds as State tags").
+### Occurrences: one record, shared (revision 4)
 
-**Lookup walks up tag parents.** `Action.Weapon.Fire.Suppressed` falls back to `Action.Weapon.Fire`, so only exceptions need their own rows.
+Today `FContextData` is the queued occurrence, the worker's result and the running behavior all at once, and it's copied whole at each step. Because a behavior and an occurrence are the same type, `ActionPerformed` builds the occurrence by copying the behavior, which is the intent leak.
+
+**One context, and thin holders that point to it:**
+- **`FOccurrenceEvent`:** the record of one happening. `RaiseOccurrence` builds it and nothing changes it afterwards. Held through `TSharedRef<const FOccurrenceEvent>`, so every worker and candidate reads the same one without locks.
+- **The running behavior:** a reference to the occurrence that started it, a pointer to its purpose, and its score. The reference is also what lets the behavior be re-scored against its own subjects at each new occurrence. It copies none of the occurrence's fields, so there's nothing to keep in sync.
+- **No selection struct.** The worker's result is a local that becomes the behavior on a yes.
+
+**What the record holds:**
+- The event tag, context key, time raised, and activation id.
+- Subjects, as character ids plus weak object pointers.
+- Values captured when raised: location and direction, the performing equipment's signature attributes (see "Equipment and latent actions"), and the effect magnitude.
+- `Cause`: a weak pointer to the occurrence that started the behavior which raised this one.
+
+**Cause chains.** B fires at A. C's fire points to B's, D taking cover from C points to C's, and B flanking D points to D's. Each link is an existing record, so nothing is copied, and no one can rewrite a link someone else is holding. Others see links only through relevance (see "Relevance-gated history").
+
+**Links are readable for a set time (decided 2026-11-16).** A record can be read as a cause for a set time after it was raised. The link is pruned a margin later. So no condition depends on whether some unrelated AI still remembers the cause, and the time also bounds how long a chain can get. The weak pointer stays as the safety net: a worker pins the link before reading, so a record can't be destroyed mid-read even if a backlogged queue outlasts the margin.
+
+**Lifetime: freed when nothing needs it.**
+- A record isn't a UObject. It's reference-counted and freed the moment its last holder lets go, with no GC involved.
+- **Holders:** workers while evaluating it, the behaviors it started, and the history entries that remember it. If an occurrence produced no yes, it's freed as soon as the last worker finishes. If hundreds of AI reacted, there's still one record and hundreds of pointers. Copying would cost one full copy per reaction.
+- **`Cause` is weak**, so a chain doesn't keep its past alive. A link lives while someone's history or running behavior still refers to it and disappears when everyone has forgotten it.
+
+**When a subject is garbage collected.** The record never depends on a live object:
+- It holds the character ids and the values captured when it was raised, so a destroyed actor doesn't change who it was about or what happened. Only the weak pointer goes null.
+- Who a behavior belongs to isn't stored in the occurrence: the component that holds the behavior is its owner.
+- Copying wouldn't protect against this. A copy holds the same weak pointers, and strong ones would keep dead actors alive.
+- **Rule:** anything a later reader needs is captured by value when the occurrence is raised. Object pointers are only for reaching live state on the game thread, and must be null-checked.
+- A subject dying mid-behavior is itself an occurrence (death, or `State.Downed`), so a behavior aimed at it is replaced through the normal path.
+
+**Every happening builds a record; only some are queued.** A hit from the same activation as the last one in its context builds a record and adds a history entry pointing to it, but isn't queued for evaluation (see "Occurrence identity and repeats").
+
+### Occurrence definitions and relevance lists (revision 4)
+
+**Gameplay tags carry no data.** A tag has a name, a developer comment and the source it was declared in. `meta=(Categories="...")` on a UPROPERTY only filters the tag picker, and the tag manager ignores extra fields on `FGameplayTagTableRow` subclasses. So data about a tag lives on that tag's definition in the purpose library.
+
+An occurrence definition (`Action.Fire`, `Effect.Damage`, `State.Suppressed`…) holds:
+- **A relevance list:** intent tags at any level, each with a weight. An intent that isn't covered defaults to 1.0. It replaces revision 3's single relevance matrix, which would have been cumbersome to author, while splitting it into several matrices would lose perspective. Example for `Action.Fire`:
+
+  | Entry | Weight | Covers |
+  |---|---|---|
+  | `Intent.Act.Patrol` | 0.1 | Every patrol variant |
+  | `Intent.Act.Contact` | 2.0 | Every contact behavior, at every scope |
+  | `Intent.Investigate.Watch` | 1.5 | One behavior, overriding the activity's default |
+
+  - **Most specific entry wins.** An intent walks up its own tag until it finds an entry. Lists are flattened into a lookup when the library loads, so evaluation does one map lookup per parent level.
+  - **The list lives on the definition of the happening, never on the performer's intent.** Two identical shots must weigh the same to observers whatever the shooter's motive.
+  - **The observer's role isn't in the list.** Being the target, hearing it from 60 m away, or being the target's squadmate are told apart by the purposes' own Subject conditions.
+- **Retention:** how long history entries of this kind are kept.
+- **Outcome fields** recorded for this kind of happening, such as hits landed for fire.
+
+An intent definition holds its conditions, behavior ability, scoring and self weight (see "Self-reaction").
+
+**Where an occurrence reaches:** loudness and visibility come from the performer's attributes evaluated for the action's tag, with equipment GEs included, captured in the record. The routing cull's maximum radius is derived from them. Whether a candidate heard it is a condition: loudness against distance and the candidate's hearing. How the `Action.Communicate.Verbal.*` levels get their loudness, with no equipment performing them, is open (see "Open questions (revision 4)").
+
+**Settings.** What remains is system configuration with no owning definition: thread count and budgets. If nothing else turns up, there's no `UPurposeSettings` at all.
+
+### Equipment and latent actions (revision 4)
+
+**The action is the verb; the variance comes from what performed it.** A rifle shot and a pistol shot are both `Action.Fire`. Their loudness, visibility and anything else observers react to come from the GEs the weapon applies to its wielder, evaluated for `Action.Fire` and captured in the occurrence. A suppressor is another GE for as long as it's attached.
+
+**Equipment as a subject (role name tentative: Equipment).** The object an action was performed with is a subject of its own, separate from the instigator. It isn't always a hazard: a ladder or a laser alarm is equipment too. Holstered and slung items are world items socketed to a character, the same as items on the ground, so they can be subjects and providers in their own right.
+
+**Latent actions, such as a grenade:**
+1. **`Action.Throw`:** the instigator is the thrower, the Equipment subject is the grenade, and the target is where it lands. Observers can react to the grenade as a position to get away from, while the thrower stays the one responsible.
+2. **The detonation** is its own occurrence, raised later by the grenade. It carries the thrower's character id, the same way the custom effect context does, and its `Cause` points to the throw. Its loudness is read from the grenade's own GE, which never applies to the thrower (see "Character attributes"). The context key includes the tag, so it raises an occurrence despite sharing the throw's activation id.
+3. **Lingering hazards** (a cooked grenade on the ground, fire, gas) can be purpose providers while they exist, so their purposes reach anyone in range without re-raising an occurrence.
+
+**What kind of thing it is** (explosive, obscurant, how dangerous at this range) should come from the equipment's attributes rather than a fixed tag, since effectiveness depends on proximity and the observer's health. To be designed later.
 
 ### The flow
 
 #### 1. Something happens: an occurrence
 
-Every occurrence carries the identity tag of what happened, its context key, the time it was raised and, for actions and hits, the cause's activation id. Sources:
+Every source calls the manager's `RaiseOccurrence`, which builds the immutable record (see "Occurrences: one record, shared"). It carries the identity tag of what happened, its context key, the time it was raised, the subjects' character ids, the values captured from the performing equipment and, for actions and hits, the cause's activation id. For an action performed by a behavior, `Cause` is the occurrence that started that behavior. Sources:
 - **Tasks.** Each action a behavior starts already raises an occurrence (`ActionPerformed`, end of `AI_SequentialActions.cpp`'s action setup). The tag is the task's own `Action.*` tag. Communication is a task like any other. The occurrence no longer copies the behavior's subject map or context data.
+- **Equipment acting later.** A thrown grenade raises its detonation itself, carrying the thrower's id, with `Cause` pointing to the throw (see "Equipment and latent actions").
 - **Gameplay effects.** Damage arrives as a GE. Its `FGameplayEffectContext` already holds:
   - Instigator → `ESubject::Instigator`.
   - EffectCauser and SourceObject → the weapon.
@@ -522,7 +638,8 @@ There is no occurrence for selecting a behavior. The behavior's first action is 
   - its current behaviors, one per layer, with intent and reference. Only self-reaction conditions read these,
   - how it perceived this occurrence.
 - **Other subjects:** copied once and shared by every candidate. Conditions read them through the gated accessors, so each candidate sees only what its relevance allows. Their current behaviors are never included.
-- **Context:** the occurrence tag, location and direction, GE magnitude.
+- **Context:** the occurrence record itself, shared rather than copied: its tag, location and direction, captured equipment values, GE magnitude, and its cause chain (read through relevance).
+- **History** in the snapshot holds references to occurrence records, so copying a history copies pointers, not context fields.
 - **Virtual subjects:** Reference, last known positions.
 - **Group subjects:** each candidate's own chain, appended during routing.
 - **The tactical grid:** a pointer to the current published version, so every condition in the occurrence reads the same one (see "Spatial perception").
@@ -530,12 +647,16 @@ There is no occurrence for selecting a behavior. The behavior's first action is 
 #### 4. Evaluation (worker)
 
 0. **Drain and merge.** The thread drains its queue and keeps only the newest occurrence per context key (see "Occurrence identity and repeats").
-1. **Relevance matrix and upper-bound pruning.** This keeps the spirit of utility while still cutting cost.
-   - A matrix in the Purpose settings gives a weight for each pairing of occurrence tag and intent tag. Both look up through tag parents, so a few parent rows cover most cases, for example `Action.Weapon` × `Intent.Patrol` = low. Individual purposes can override their row.
+0b. **Re-score the current behaviors (decided 2026-11-16).** Before any new purpose is considered, each of the candidate's current behaviors is scored again with the fresh snapshot. That score, not the one it was selected with, is the baseline a new purpose has to beat on that layer.
+   - **Attributes act here.** A guard's rising Boredom lowers the re-scored patrol through its conditions, so a smaller occurrence can win than it could an hour earlier. A disciplined guard's patrol re-scores high. Nothing decays on a timer, and the re-check runs only because an occurrence arrived.
+   - **Pruning gets a real floor.** The baseline is usually well above 0, so fewer purposes survive the upper-bound check below, and the winner must beat what the AI is doing rather than just exceed 0.
+   - **It's scored against its own occurrence.** The behavior holds the record that started it, so its conditions read their original subjects and reference, with fresh snapshots of those subjects. The relevance weight is the one from its original occurrence.
+1. **Relevance list and upper-bound pruning.** This keeps the spirit of utility while still cutting cost.
+   - The occurrence's definition gives a weight for each intent through its relevance list: the most specific entry above the intent's tag, or 1.0 (see "Occurrence definitions and relevance lists"). For example, `Action.Fire` weights `Intent.Act.Patrol` at 0.1.
    - The weight is a real scoring factor, not a gate.
-   - Each purpose's highest possible score is its `FPurpose::Potential` times that weight. If even that can't beat the candidate's current score on the layers it needs, the purpose is skipped without scoring its conditions. Skipping changes nothing, because scoring it couldn't have won.
+   - Each purpose's highest possible score is its `FPurpose::Potential` times that weight. If even that can't beat the re-scored baseline on the layers it needs, the purpose is skipped without scoring its conditions. Skipping changes nothing, because scoring it couldn't have won.
    - A weight of 0 is an explicit authoring statement: this intent never reacts to this kind of occurrence.
-   - A separate self weight applies when the candidate is the instigator. It's 0 except for purposes marked as self-reactions.
+   - A separate self weight, on the intent's own definition, applies when the candidate is the instigator. It's 0 except for purposes marked as self-reactions.
 2. **Tag gate.** Check the behavior ability's activation required, blocked and cooldown tags against the snapshot's copied tag container.
    - They're protected on `UGameplayAbility`, so `UBehavior_AI` exposes them.
    - Don't call `CanActivateAbility` here: it isn't thread-safe, but comparing tags against a copied container is.
@@ -544,9 +665,10 @@ There is no occurrence for selecting a behavior. The behavior's first action is 
 
 #### 5. Selection (game thread, `ProvidePurposeToOwner`)
 
-1. **Continuation check.** If the winner has the same intent and reference as a current behavior, that behavior keeps running and only the reaction is recorded on the occurrence's history entry. Stop here.
+0. **A no changes nothing.** If no purpose beat the current behaviors' re-scored baselines, they keep running. Nothing re-checks them until another occurrence arrives.
+1. **Same behavior check.** If the winner has the same intent and reference as a current behavior, that behavior keeps running and only the reaction is recorded on the occurrence's history entry. Stop here.
 2. **End the conflicting current behaviors.** Step 7 runs for each, with the outcome Interrupted. A new reference always starts a new behavior, even with the same intent.
-3. **Set the new behavior** and write its Reference subject. Record its intent id as the reaction on the occurrence's history entry.
+3. **Set the new behavior:** a reference to the occurrence that started it, its purpose and its score. Write its Reference subject, and record its intent id as the reaction on the occurrence's history entry.
 4. **Apply OnSelected before performing the ability.** Today OnSelected runs after the first task has already started, so that task can't see Context-targeted modifiers.
 5. **Apply the OnSelected changes:**
    - Numeric and timed changes become GameplayEffects applied to the subject's ASC. For example, `GE_Engaged`: 5 s, one stack per combatant, grants `State.Combat.Engaged`, +1 to the Engaged attribute.
@@ -696,6 +818,30 @@ A player (character id 37) fires a full-auto burst at AI A. A and its ally B, 20
 11. **A takes stock.** By now A has fired at the player six times and seen one land. A watched the player fire, so A can read the player's fire entries at A through relevance: 8 of 12 landed. "Fall back" scores higher. A never copied the player's numbers into its own history.
 12. **E watches A.** As in revision 2. E reads A's `State.Suppressed`, position and observable attributes while it perceives A, but receives none of A's self occurrences.
 
+### Worked example (revision 4, 2026-11-14)
+
+What changed since revision 3:
+- The manager builds every occurrence through `RaiseOccurrence`. Records are immutable and shared, and each points to its cause.
+- Loudness and visibility come from the equipment's attributes, captured when the occurrence is raised. There's no settings table.
+- Relevance comes from the occurrence definition's weighted list of intent tags, not a matrix.
+- Action tags name the verb (`Action.Fire`, `Action.Throw`), and the equipment is its own subject.
+- Behavior changes only on a new occurrence. Boredom and focus are attributes.
+- History entries point to occurrence records instead of copying their fields.
+
+A player (character id 37) carries a suppressed rifle. AI A and B are in squad S1. Guard G, in S1 too, is on a long patrol 40 m away and bores easily. F, in squad S2, is out of earshot.
+
+1. **Before the fight.** G has patrolled for ten minutes, and a boredom GE has been raising G's Boredom attribute the whole time. Nothing re-evaluates G's patrol while that happens. Then a bird lands near G, a small world occurrence. G's patrol is re-scored first, and its Boredom condition drags it down; that's the baseline. "Watch the distraction" also scores on Boredom and beats it. A disciplined guard with low Boredom would have ignored the same bird. Either way, a player watching saw the bird.
+2. **The shot.** The player's fire ability performs `Action.Fire`. `RaiseOccurrence` builds record R1: instigator 37, the rifle as the Equipment subject, activation 812. Its loudness is the player's Loudness evaluated for `Action.Fire`: the rifle's and the suppressor's GEs both apply, the boots' don't. The value is captured in R1. The routing reach is derived from that loudness.
+3. **The hit.** `GE_Damage` lands on A. The custom effect context carries 37, 812 and `Action.Fire`. Record R2 (`Effect.Damage`) is built, with `Cause` pointing to R1. A's history entry points to R2.
+4. **Relevance.** `Action.Fire`'s list weights `Intent.Act.Patrol` at 0.1, so patrol purposes are pruned without scoring. Nobody's list mentions G's distraction behavior, but G doesn't hear R1: the captured loudness against 40 m fails G's hearing condition. B, 10 m away, does hear it.
+5. **A reacts.** "Cover from Instigator" wins. A's behavior holds a reference to R2, the purpose and its score, and nothing else. A's MoveTo performs `Action.Move` as record R3, with `Cause` = R2.
+6. **B returns fire.** B's suppress behavior was started by R1, so B's own `Action.Fire` record R4 has `Cause` = R1. B's rifle has no suppressor, so R4's captured loudness is high.
+7. **G hears B.** R4 reaches G. `Action.Fire`'s list weights `Intent.Investigate` above 1.0, and G's investigate beats watching the bird. G's behavior holds R4, which records B's position at the moment of firing.
+8. **A grenade.** The player throws a grenade at B: record R5, `Action.Throw`, instigator 37, the grenade as the Equipment subject, target the landing point. B sees it land. "Get clear of the Equipment subject" reads the grenade's position from R5. Then the grenade raises its own detonation, R6, carrying 37, with `Cause` = R5. The tag differs from R5's, so R6 is queued despite sharing the throw's activation.
+9. **B dies, and the actor is destroyed.** G's investigate still holds R4. Its weak pointer to B goes null, but R4 still has B's character id and the position captured when B fired, so G carries on to that position. B's death is its own occurrence, and G's yes or no to it is the normal path.
+10. **F learns of it.** S1's contact report raises `Action.Communicate.Verbal.Normal` (R7) with content about 37 and A being hit. F's squad hears it over the radio, and F's history now points to R7. Through R7, F can see R2: that A was hit by 37. F can't follow R2 back to R1's details, such as where the player fired from, because nobody told F's group. That link reads as "caused by something I don't know".
+11. **Lifetimes.** If R1 had produced no yes from anyone, it would have been freed as soon as the last worker finished. Instead A's, B's and G's history entries hold it until `Action.Fire`'s retention expires. R2 lives while A's cover behavior or any entry still refers to it. When the last holder lets go, the record is freed, and the weak `Cause` links pointing at it simply go null.
+
 ### What stays Purpose-only
 
 - Scoring, selection, conditions and curves.
@@ -737,20 +883,20 @@ Places where I'm unsure what you intended, or where a choice is still open.
   - **Hitscan:** the result is known when the shot fires, so hit or miss is recorded at once.
   - **Projectiles:** a hit arrives on impact, through the ids in the effect context. A miss needs its own signal, such as the projectile expiring or striking something other than the target.
   - **Either way:** a miss has to be recorded explicitly, because only hits apply an effect.
-- **What a fire entry stands for.** One entry per round, or one per activation (trigger pull)? A hit/miss ratio needs rounds, but `ActionPerformed` runs per activation, so a burst would have to add an entry for each round as it fires.
+- **What a fire entry stands for.** Revision 4: one entry per repeat occurrence, carrying the count of rounds since the previous one. Hits still need to reach the right entry. One entry per round, or one per activation (trigger pull)? A hit/miss ratio needs rounds, but `ActionPerformed` runs per activation, so a burst would have to add an entry for each round as it fires.
 - **Own attribute changes.** Should an entry also record changes to the owner's own attributes ("my Health −40 from P"), or should conditions just read current attributes? Others never see either.
 - **Decided (2026-11-08): one timestamped entry per happening,** then monitor how the data builds up and optimize from there (see "Monitoring history"). Considered and deferred: one record per context with a fixed-size time series, and one record per context with attributes alone carrying intensity. Both stay on the list of optimizations once there's data.
 - **Name for the position-finding action.** The EQS task only finds a spot; moving there is the MoveTo task's `Action.Move`. `Action.Query.Position` reads as asking for a position, which is what the task does, but if that's unclear, `Action.Seek.Position` matches its `State.Position.Seeking` phase.
-- **Retention.** How long entries live, and the per-character cap. Monitoring should set these. A context whose entries have all been pruned is forgotten, so a long-past exchange with an enemy no longer counts.
+- **Retention.** How long entries live, and the per-character cap. Revision 4 puts retention on each occurrence definition and the cap on the character's component; monitoring should set the values. A context whose entries have all been pruned is forgotten, so a long-past exchange with an enemy no longer counts.
 
 **Occurrence identity**
 - **Concern: thread routing for merges.** Merging needs every repeat of a context on the same thread, so threads would be picked by a hash of the context key rather than purely by queue depth. A busy context, such as one AI under sustained fire, could then pile work onto one thread while others sit idle. Measure the imbalance under load before settling on it. One option is to hash by context key and fall back to the least-loaded thread when the hashed one is far behind, accepting that those repeats may not merge.
 - **What counts as one activation.** `UAT_Repeat_Input` sends a gameplay event on an interval. If each event activates the fire ability, every round is a new activation and raises an occurrence. Should full auto become one activation that fires internally, as you suggested, with `UAT_Repeat_Input` kept for other repeats?
-- **Long bursts and late listeners.** With one occurrence per trigger pull, someone who comes into earshot mid-burst gets no occurrence until the next activation. Acceptable, or should the burst re-raise its action occurrence on an interval?
+- **Resolved in revision 4: long bursts and late listeners.** Continuous actions re-raise every N physical events while active. Every candidate receives each repeat; merging and a novelty condition keep it from re-triggering reactions (see "Occurrence identity and repeats").
 - **The custom effect context.** Recommended: ids only (character id, activation id, action tag), not our `FContextData`. Confirm, or name anything else the receiver needs.
 
 **Self-reactions and State tags**
-- **Which State tags raise self occurrences.** All of them, or a list in the settings (recommended)? Phase tags like `State.Position.Moving` change often and probably shouldn't.
+- **Resolved in revision 4: which State tags raise self occurrences.** Those with a definition in the purpose library. Phase tags like `State.Position.Moving` simply get no definition.
 - **Visible state changes.** A State tag change reaches only its owner. When others should react to it, such as someone going down, does the downed mechanic perform an action (`Action.*`) that others perceive, or do others notice only on their next occurrence?
 - **Self-reactions on a group's action.** When a member performs a squad task's body action, does that member's self-reaction see the squad task as its current behavior?
 
@@ -762,6 +908,45 @@ Places where I'm unsure what you intended, or where a choice is still open.
 
 **Ability duplication**
 - **Instancing doesn't remove `GiveAbilityDuplicate`.** GAS instantiates from the class (`CreateNewInstanceOfAbility` → `NewObject(Owner, Ability->GetClass())`, `AbilitySystemComponent_Abilities.cpp`). So per-purpose values on the inline template would be lost whatever the policy. The route in the `Design: GAS AbilitySpec SourceObject` note in `PurposeAbilityComponent.h` still applies: grant one spec per purpose per actor with the purpose asset as `SourceObject`, `InstancedPerActor`, and reuse it (Performance #4). Confirm before the refactor.
+
+### Open questions (revision 4)
+
+**Tags**
+- **Placing the current intents under activities.** Is Cover an `Act` or a `React`? `React` is "a form of inaction" (holding, freezing, staying down), so moving to cover may be `Act`.
+- **More activities** as behaviors are added.
+
+**Signatures and equipment**
+- **Resolved (2026-11-16): equipment carries GEs, applied to the wielder,** with modifiers tag-required to their action (see "Character attributes").
+- **Resolved (2026-11-16): footsteps and other continuous actions** re-raise at an interval while active, like automatic fire.
+- **Resolved (2026-11-17): re-raise interval.** A time on the action's definition, checked on each physical event, never by a timer. The record carries the count of rounds or steps since the last repeat.
+- **Hits under the same rule?** Revision 3's hit rule is still a gate: a hit from the same activation as the latest one in its context only records. Should hits follow the action rule instead, raising every N hits and leaving novelty to a condition?
+- **Resolved (2026-11-16): carried but not held.** Only equipment in hand is equipped. Holstered items are socketed world items.
+- **Resolved (2026-11-16): latent equipment's signature.** The throwable keeps its own GE, never applied to the owner, and its magnitude is read directly when the detonation is raised.
+- **Resolved (2026-11-17): action GE duration.** Isolation comes from the tag requirements, not the duration. A footstep GE's modifier requires `Action.Move`, so speech raised right after a step is evaluated for `Action.Communicate.*` and never includes it. The duration only removes the GE afterwards, so its exact length doesn't affect any value. It can't be an Instant GE, which would permanently change the attribute's base value.
+- **Voice levels.** The innate GE from character data carries one modifier per `Action.Communicate.Verbal.*` level tag. Confirm.
+- **Which attributes an action reads.** Does each occurrence definition name the attributes to capture (loudness, visibility…), or does every record capture a fixed set?
+- **Equipment role name:** Equipment, or something broader.
+- **What a piece of equipment is** (explosive, obscurant, how dangerous) from its attributes rather than fixed tags. Later.
+
+**Observable attributes**
+- **Resolved (2026-11-16): there's no observable/private mark.** Perception decides, with an attribute snapshot kept when a subject stops being perceived.
+- **Snapshot contents.** All attributes, or only those some condition reads about other characters? Monitoring can decide, as with history.
+
+**Occurrence records**
+- **Finding a hit's cause record.** The effect context carries ids, not the record. The manager could keep live action records indexed by (character id, activation id), so a hit's record can point to its fire record. That map has to stay consistent with records being freed.
+- **Resolved (2026-11-16): chain depth.** Links are readable for a set time and pruned a margin later.
+- **Where the chain time lives:** on each occurrence definition, like retention, or one value for every link?
+- **How communicated content links in.** When a report tells F's group about R2, is the communication's record what makes R2's link visible, or does F's group get its own history entry pointing to R2?
+
+**Selection and individuality**
+- **Resolved (2026-11-16): what a new candidate has to beat.** The current behaviors, re-scored at each new occurrence.
+- **Resolved (2026-11-16): a current behavior that fails its own re-score** keeps running. Ending is left to the behavior's own finish conditions. Its low re-scored baseline means almost anything replaces it at the next occurrence.
+- **Re-score cost.** One extra purpose per layer per candidate per occurrence, plus fresh snapshots of the current behaviors' subjects. Small, but it adds to snapshot building on the game thread.
+- **The self weight default.** It's 0, unlike list weights at 1.0, so AI don't evaluate every one of their own actions. Confirm.
+
+**Manager**
+- **Subsystem plus director actor** (as written), or a single director actor.
+- **Thread count**, and whether it scales with the host's core count.
 
 ## Design: spatial perception (proposed)
 

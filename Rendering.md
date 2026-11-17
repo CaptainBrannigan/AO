@@ -58,6 +58,66 @@ AO is baked into vertex color **G** (Cycles can bake directly to a Color Attribu
 - Point domain for smooth occlusion; needs vertex density in creases, which fits the higher-poly direction. On skinned meshes it's baked in the bind pose.
 - **UE caveat:** the material's Ambient Occlusion input only affects **indirect** light, so it's subtle in mostly direct-lit scenes. For a visible stylized result, multiply AO into Base Color. At that point AO and the shade channel do the same job, and one channel may cover both.
 
+## Wounds and impact marks (planned 2026-11-17)
+
+Not built yet. The game is about visual data, so wounds stay visible, age, and show the history of a fight.
+
+**Drawn by the mesh's own material, not decals.**
+- Decals don't break the textureless style; a decal's material can be textureless too. But on skinned, moving characters a world-space projection slides as the surface deforms. Its projection box also marks anything passing through it, and DBuffer decals add passes at stereo resolution.
+- Instead, the material compares each pixel's position in mesh space with a short list of wound points. Skinned meshes use `PreSkinnedPosition`, so wounds follow animation exactly. Inside a wound's radius, the pixel blends toward the wound color. Edges can be softened or broken up with noise. There's no extra pass and no texture.
+
+**Where the data lives: Custom Primitive Data.**
+- CPD has 36 floats (`NumCustomPrimitiveDataFloat4s = 9`, `SceneTypes.h`), and the 9 region colors use all of it as RGBA. Two layouts:
+
+  | Layout | Free floats | Wounds |
+  |---|---|---|
+  | Colors stay RGBA; wounds use the 9 unused alphas (CPD indices 3, 7, 11 … 35) | 9 | 9, one float each |
+  | Each color packed into one float (8 bits per channel) | 27 | 9 at two floats each, or more |
+
+- Packing a color costs 8-bit precision per channel, so pack in sRGB and convert to linear in the material, since 8-bit linear bands in dark colors. It also loses values above 1.0, and the CPD fields no longer read as colors, so authoring goes through a pack helper.
+- The `Test_NoTexture` Blueprint writes colors with `SetDefaultCustomPrimitiveDataVector4`, which also writes alpha. If the alphas hold wounds, colors must be written as Vector3s.
+- Instanced meshes use per-instance custom data the same way, with no 36-float limit.
+
+**Packing a wound into one float.** A float holds whole numbers up to 2^24 exactly, so one float carries 24 bits. Each field is a 0–1 value: the bits divided by their maximum, then used as a lerp.
+- **Position:** each axis is a lerp across the mesh's bounds. 6 bits gives 64 steps, about 3 cm over a 2 m character; smaller socketed pieces get finer steps.
+- **Intensity:** a lerp from fresh to aged. 6 bits gives 64 steps; 8 bits gives 256.
+- **Example splits:** x/y/z/intensity at 6 bits each with a fixed radius, or x/y/z at 5 bits (~6 cm) plus 8-bit intensity. With packed colors, each wound gets a second float for radius, intensity, or age.
+- Unpacking in the Custom node is `floor` and `fmod` by powers of two, which is exact at these sizes.
+
+**Shader cost (estimate, to measure).** Each wound is one shape test per pixel, for every pixel of the mesh.
+- **Per wound:** about 5 instructions for the distance test and blend. Unpacking a packed float adds roughly 15 more (floor, fmod and a lerp per field).
+- **Totals:** 9 packed wounds is about 150–200 instructions. That's close to doubling the base pass, which is ~205 instructions, of which our graph is 15–20 (see "Measured material stats"). Unpacked full floats cost less per wound but fit fewer.
+- **Mitigations:**
+  - Loop only over active wounds in a Custom node, so the cost scales with how many wounds a mesh has, and is zero for an unwounded mesh. The branch depends only on per-object data, so every pixel takes the same path and branching is cheap. Encode "empty" as a reserved value, such as radius or intensity 0, so the loop stops at the first empty slot.
+  - Put wounds behind a static switch, so meshes that never take wounds compile without them.
+
+**Aging.**
+- Intensity drives a blend from a fresh color to an aged one: bright red to dried dark on a character.
+- Healing darkens wounds rather than removing them.
+- When all slots are full, a new wound replaces the darkest (oldest) one.
+
+**Updates and replication.**
+- Write CPD only on events (hit, heal), never per frame. For ISM crowds, each write uploads that instance's data to the GPU.
+- CPD isn't replicated. Replicate the packed wound list on the character, and let each client write its own CPD from it.
+
+**Other surfaces: stone, wood and more (note for later).** The same system should mark other object types, so radius, colors and intensity range are **material instance parameters**, not constants in the master:
+
+| Surface | Radius | Colors and intensity |
+|---|---|---|
+| Blood on characters | Largest; spreads | Fresh red to dried dark |
+| Wood | Moderate; spreads a little, nowhere near blood | Splintered light to dark |
+| Stone | Very small (a bullet pit) | Darkest intensity from the start |
+
+- The packed radius and intensity stay 0–1 values. Each material instance supplies the range they map to, such as its maximum radius and its fresh and aged colors. One packing format then serves every surface.
+- **Large world meshes.** Position precision scales with the mesh's bounds: 64 steps across a 10 m wall is about 16 cm, too coarse for a bullet hole. A wall also takes far more than 9 hits.
+
+**Budgets (decided 2026-11-17):**
+- **Players: 9 wounds.** AI: up to 3, which fit packed in 3 of the spare alphas. Set the maximum per material instance; a static switch for the count compiles a separate permutation.
+- **Buildings: static decals.** World geometry doesn't deform, so decals don't slide. Each decal is its own draw, so cap the count and recycle the oldest.
+- **Candidate: impacts as geometry instead of decals,** in keeping with the geometry-driven style. Small chip or crater meshes are placed at the hit point, offset slightly along the normal to avoid z-fighting, with a dark inner face that reads as a hole without cutting the surface. Each impact type is one instanced component (Nanite ISM), so thousands of impacts stay one draw per type per pass, with shadow casting off. Real holes would need masked materials (Nanite's programmable raster) or mesh booleans; avoid both. Compare against decals by measuring once world impacts are built.
+
+**Cost note:** with the loop, the work done per pixel scales with active wounds, but the compiled shader still contains the loop. That can raise register use, a small fixed cost even for unwounded meshes. Measure with and without the static switch.
+
 ## Character composition
 
 **Why it matters:** each mesh component draws at least once in every pass it appears in (depth prepass, base pass, each shadow cascade, velocity). A 4-part character with ~5 passes is ~20 draws instead of ~5. Skeletal meshes don't batch with each other (each has its own bone buffer), and each also costs a transform update, culling, bone-buffer upload and skinning dispatch. With dozens of AI this lands on the render thread, which is already tight in VR. Negligible for one character; significant at DMZ-style density.
