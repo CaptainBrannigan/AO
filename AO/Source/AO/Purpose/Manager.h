@@ -8,6 +8,21 @@
 #include "PurposeEvaluationThread.h"
 #include "Data/DatamapInterface.h"
 #include "Manager.generated.h"
+UENUM(BlueprintType)
+enum class EFactionID : uint8
+{
+	None UMETA(DisplayName = "None")///Default to ensure data is set with HasData()
+	, SOCOM UMETA(DisplayName = "SOCOM")//1
+	, SAS UMETA(DisplayName = "SAS")//2
+	, SASR UMETA(DisplayName = "SASR")//3
+	, JTF2 UMETA(DisplayName = "JTF2")//4
+	, GROM UMETA(DisplayName = "GROM")//5
+	, KSK UMETA(DisplayName = "KSK")//6
+	, FSK UMETA(DisplayName = "FSK")//7
+	, SOG UMETA(DisplayName = "SOG")//8
+	, UDT UMETA(DisplayName = "UDT")//9
+	, Spetsnaz UMETA(DisplayName = "Spetsnaz")//10
+};
 
 USTRUCT(BlueprintType)
 /// <summary>
@@ -19,30 +34,62 @@ USTRUCT(BlueprintType)
 /// </summary>
 struct FPurposeEntity
 {
+	GENERATED_BODY()
+
+	static constexpr uint32 MemberBits = 12;
+	static constexpr uint32 ManagerBits = 12;
+	static constexpr uint32 FactionBits = 8;
+
+	static constexpr uint32 ManagerShift = MemberBits;
+	static constexpr uint32 FactionShift = MemberBits + ManagerBits;
+
+	static constexpr uint32 MemberMask = (1u << MemberBits) - 1;	/// 0xFFF
+	static constexpr uint32 ManagerMask = (1u << ManagerBits) - 1;	/// 0xFFF
+	static constexpr uint32 FactionMask = (1u << FactionBits) - 1;	/// 0xFF
+
+	UPROPERTY()
+	uint32 id = 0;	/// 0 is invalid: faction None, manager 0
+
+	FPurposeEntity()
+	{
+	}
+	FPurposeEntity(EFactionID faction, uint32 managerIndex)
+	{
+		check(managerIndex <= ManagerMask);
+		id = (uint32(faction) << FactionShift) | (managerIndex << ManagerShift);
+	}
+
+	FPurposeEntity(const FPurposeEntity& managerEntity, uint32 memberIndex)
+		: FPurposeEntity(managerEntity.GetFaction(), managerEntity.GetManager())
+	{
+		check(memberIndex <= MemberMask);
+		id |= memberIndex;
+	}
+
+	EFactionID GetFaction() const { return EFactionID((id >> FactionShift) & FactionMask); }
+	uint32 GetManager() const { return (id >> ManagerShift) & ManagerMask; }
+	uint32 GetMember() const { return id & MemberMask; }
+
+	bool IsValid() const { return id != 0; }
+	bool IsManager() const { return GetManager() != 0 && GetMember() == 0; }
+
+	bool operator==(const FPurposeEntity& other) const { return id == other.id; }
+	friend uint32 GetTypeHash(const FPurposeEntity& entity) { return entity.id; }
+};
+
+USTRUCT(BlueprintType)
+/// <summary>
+/// Data used by POIs in PCG generation to provide managers with world data
+/// </summary>
+struct FManagementData
+{
 	GENERATED_BODY();
 public:
 
-	uint8 entityID = 0;
-
-	bool operator==(const FPurposeEntity& Other) const
-	{
-		return Equals(Other);
-	}
-
-	bool Equals(const FPurposeEntity& Other) const
-	{
-		return entityID == Other.entityID;
-	}
+	FVector location = FVector(0);
+	float locationBounds = 0.0f;
+	int AIAllowanceForManager = 0;
 };
-#if UE_BUILD_DEBUG
-uint32 GetTypeHash(const FHashMeIfYouCan& Thing);
-#else // optimize by inlining in shipping and development builds
-FORCEINLINE uint32 GetTypeHash(const FPurposeEntity& Thing)
-{
-	uint32 Hash = FCrc::MemCrc32(&Thing, sizeof(FPurposeEntity));
-	return Hash;
-}
-#endif
 
 UCLASS()
 /// <summary>
@@ -76,7 +123,7 @@ public:
 public:
 	void Occurrence();
 
-	
+	FManagementData managerData;
 protected:
 
 	/// <summary>

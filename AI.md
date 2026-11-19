@@ -12,7 +12,7 @@ DMZ-style density: many AI that stay interesting, in player-hosted sessions wher
 
 ## Current direction
 
-- Build revision 4 in the order of "Purpose refactor: implementation order", starting with the manager. The load-balancer bug and the fixed-sleep throughput cap land in its first phase; they change how the system behaves under real load, not just its efficiency.
+- Build revision 4 in the order of "Purpose refactor: implementation order", starting with the purpose subsystem. The load-balancer bug and the fixed-sleep throughput cap land in its first phase; they change how the system behaves under real load, not just its efficiency.
 - Separate perception from decision (see "Behavior design") before scaling up AI density.
 - Render distant AI cheaply: kit as attached static meshes, and baked-animation static meshes for distant bodies (see "Rendering AI at scale").
 
@@ -45,7 +45,7 @@ Destruction and other world changes should raise occurrences too: a building bre
 This section describes how an occurrence should travel from "something happened" to an AI reacting. GAS covers what it already does well: state, quantities, timed effects, gating, task resources, cooldowns and cosmetic replication. The Purpose system keeps what GAS has no answer to: scoring, "how long ago", relevance, and subjects. Proposed 2026-10-28 and revised the same day after review (revision 1), on 2026-10-29 (revision 2), on 2026-11-02 (revision 3) and on 2026-11-14 (revision 4); none of it is implemented yet. The sections below describe revision 4. Earlier revisions survive only in their worked examples.
 
 **Revision 4 in short:**
-- A manager subsystem owns the threads, the purpose library and registration.
+- A purpose subsystem owns the threads, the purpose library, the faction lists, routing and the two factions. One generic manager actor with its own ability component assigns AI from an actor pool and owns their lifetime within the purpose system (revised 2026-11-18).
 - Occurrences are immutable and shared, built in one place, and point to the occurrence that caused them.
 - There is no Purpose settings table. Data about a happening or an intent lives on its definition in the library, and signatures come from attributes on the equipment or actor that performed the action.
 - Each occurrence definition has a weighted list of intent tags in place of the relevance matrix.
@@ -242,7 +242,7 @@ This extends what `IDataMapInterface` was already for: the hand-placed POIs in t
   - a last known position from relevance,
   - a communicated reference.
 - **Virtual subjects:** a place may have no UObject. The worker already reads `TMap<ESubject, FDataMap> subjectSnapshots`, so a virtual subject only needs a DataMap (Location, optionally ViewPoint and time). Only the game-thread `FSubjectMap` needs a way to carry one, as a DataMap beside the weak object pointers.
-- **Group subjects (`ESubject::Squad`, `Platoon`, `Director`):** each level of the command hierarchy is a subject with its own data: leader, bounds, recent communications. Routing appends them to each candidate's context, so an AI never has to look up its own group (see "Command hierarchy and occurrence routing").
+- **Group subjects (`ESubject::Squad`, `Faction`):** each level of the command hierarchy is a subject with its own data: leader, bounds, recent communications. Routing appends them to each candidate's context, so an AI never has to look up its own group (see "Managers and the command hierarchy").
 
 An intent is authored once and varied by its reference: cover from the Instigator, from its last known position, or from what an ally communicated.
 
@@ -303,7 +303,7 @@ The same mechanism covers other "while I'm doing that" reactions, such as raisin
 
 One occurrence per activation (see "Occurrence identity and repeats") means later hits in a burst update history without being evaluated. A reaction to the fifth hit pushing Suppression past the pinned level has to come from somewhere else:
 - **A GE grants the State tag** when the attribute crosses its threshold, such as `State.Suppressed` or `State.Downed`.
-- **Gaining or losing a State tag raises a self occurrence**, delivered only to the owner. The ASC's `RegisterGameplayTagEvent` reports the change. A State tag raises occurrences if it has a definition in the purpose library; there's no separate list. The manager binds tag events for those definitions when the library loads.
+- **Gaining or losing a State tag raises a self occurrence**, delivered only to the owner. The ASC's `RegisterGameplayTagEvent` reports the change. A State tag raises occurrences if it has a definition in the purpose library; there's no separate list. The purpose subsystem binds tag events for those definitions when the library loads.
 - **Others don't receive it.** They see the State tag only while they perceive the owner, through their own occurrences.
 
 The freed-layer occurrence when a behavior ends (see "Finish") is the same kind of self occurrence.
@@ -342,12 +342,12 @@ Two different limits, and each lives where it fits:
 | Novelty, per reference | Don't repeat what the squad already heard about enemy A | A condition on the listener's history, keyed by the reference's id |
 
 **The group owns its tasks.**
-- Each group has a `UGameplayTasksComponent`, the base class of `UAbilitySystemComponent`, so groups need no ability system. It implements `IGameplayTaskOwnerInterface`, so it can own tasks directly, with no member ability in between. The question of whether a task routed through a member's ability ends with that ability no longer arises.
+- Each group's manager has its own `UPurposeAbilityComponent` (revised 2026-11-18; see "Managers and the command hierarchy"). Revision 3 gave groups a bare `UGameplayTasksComponent`; a full ability component costs little for a few dozen groups and gives them attributes (cohesion, grade), State tags and cooldown GEs. Its tasks-component base implements `IGameplayTaskOwnerInterface`, so the group owns tasks directly, with no member ability in between. The question of whether a task routed through a member's ability ends with that ability no longer arises.
 - `GetGameplayTaskAvatar(Task)` is virtual, so a subclass returns the member performing the task.
 - **The squad holds the slot; a member performs the body action.** The squad's tasks can't see a member's Voice or Hands layer. So the squad decides and holds the slot, then has the chosen member perform the body action (speaking, signalling) as an ordinary ability. A member who is busy can be replaced by another.
 - **The squad only knows what its members perceived.** It can act only on occurrences one of its members perceived, and the performer must be one of those members. Otherwise the squad is omniscient.
 - **Losing the performer:** the task ends or switches to another member if the performer goes down.
-- **Groups are candidates.** The squad evaluates its own purposes, such as a contact report or bounding overwatch. Candidates are typed to `UPurposeAbilityComponent` today, so this needs a small generalization.
+- **Groups are candidates.** The squad evaluates its own purposes, such as a contact report or bounding overwatch. Its manager's component is a `UPurposeAbilityComponent` like any character's, so candidates need no generalization. Code in the component that assumes a pawn avatar (movement, the anim instance, view point) has to tolerate a manager, or move into a character subclass.
 
 **Slots are raw resource bits, not resource classes.**
 - `FGameplayResourceSet` is a `uint16` (`GameplayTask.h`), so a component tracks 16 resource bits.
@@ -387,49 +387,172 @@ Grade is also a speed setting: quiet signals and short commands land sooner than
 
 **Orders and recipients.** An order can name a recipient. "Await orders" is an intent (`Intent.AwaitOrders`) whose conditions read the squad leader's presence and recent communications. The leader and Intelligence weight who tends to perform squad tasks.
 
-**Platoons and the director** are candidates the same way, for purposes such as a platoon maneuver. That's the disabled Director work.
+**Factions aren't candidates** (revised 2026-11-18). They live as data on the purpose subsystem, with no ability component, so faction-wide decisions such as sending reinforcements need another home (see "Open questions (revision 4)" → "Manager").
 
-### Command hierarchy and occurrence routing
+### Managers and the command hierarchy (revised 2026-11-18)
 
-**One recursive class.** `UPurposeGroup` (a UObject implementing `IDataMapInterface`) holds:
-- its members (weak pointers to AI components),
-- its child groups,
-- its DataMap: level (`Group.Squad`, `Group.Platoon`...), leader, bounds,
-- its tasks component.
+**The root is the purpose subsystem itself.** It holds no purposes and has no location; it routes occurrences and holds the two factions. A world manager object above the factions would only be a second place holding the tree.
 
-The root belongs to the manager (see "The manager"). The logic is written once, and each level is its own object.
+**Factions are data on the subsystem.** There are always exactly two per biome, so a faction doesn't need an actor. The subsystem holds each faction's managers (as ids), its bounds, its player base, and a DataMap so the faction can be a subject that conditions read. Selecting a biome selects its two factions.
 
-This beats one manager holding tree data. Every node has to be addressable as a subject (a weak UObject in `FSubjectMap`) and own a tasks component, so the nodes would end up as objects anyway. Tasks components are actor components, so they all live on the director actor, one per group, created as groups form.
+**`AManager` is the one management class, with no subclasses.** Each manager is a lightweight actor (an `AInfo` subclass, with no location and not replicated for now) owning one `UPurposeAbilityComponent`. What kind of group it is lives in its data, the same way squad grade is data. It holds:
+- its members, as ids,
+- its DataMap: leader, bounds, home POI, grade,
+- its component's attributes, tags and tasks.
+
+Managers get an actor because an ability component needs an owner actor. GAS's actor lookup also expects one ability component per actor, so managers can't share one host actor. If squads scatter enough to cull poorly, an area-of-operation level can be added between faction and squad without changing the code.
+
+**Managers assign; the pool owns the actor.** The actor pool creates, parks and destroys bodies (see "Session startup and the actor pool"). A manager owns a body's lifetime within the purpose system:
+- it acquires bodies from the pool and assigns them to itself,
+- it registers each with the subsystem, which gives it an id,
+- it unregisters and releases a member when it dies or leaves play.
+
+So no AI is active in the purpose system without a manager, and membership has a single source. Reinforcements are a manager acquiring more bodies; squads merging is one manager handing its members to another.
+
+**What creates the managers:** the PCG ruleset decides where squads go and how many. POIs are indicators, not managers: once the world is ready, the subsystem creates a manager for each squad a POI calls for, in that faction. The POI's id goes into the manager's data as its home, so conditions can read it and the POI remains the subject of its own purposes. **Managers are never destroyed (decided 2026-11-19).** A manager stands for a location, and locations don't disappear, so a manager whose members are all gone stays, empty, until reinforcements or a transfer fill it again.
+
+**Groups move; bounds measure them (planned 2026-11-19).** There are no fixed modes such as garrison or roaming. Every manager is the same class with different data and purposes.
+- **Two places in the manager's DataMap:**
+  - **Home:** the POI it was created for. It's fixed for the manager's life, and it's why the manager is never destroyed.
+  - **Objective:** where the group means to be now. That's home for a garrison, or a village under attack for reinforcements.
+- **The manager actor doesn't move.** The group's position is its bounds and centroid, already recomputed from the members for routing, so it follows the AI by itself. Bounds measure the group; they don't confine it.
+- **Attachment, a manager attribute,** is how strongly the group is pulled back to home: high for a garrison, low for a QRF.
+- **Members stay with their group through Loyalty, a character attribute** (see "Character attributes"). It's a soft pull, not a hard leash: a condition on distance from the group's centroid or objective, weighted by Loyalty. If streaming or culling ever needs an absolute limit, it becomes a per-manager data value.
+
+**One manager per element.** A group objective assumes every member is relevant to it, so a manager never splits its group. A POI that needs a standing force plus elements that can leave gets several managers with the same home:
+- for example a garrison of 6 with high Attachment, and two roaming squads of 4 with low Attachment;
+- the PCG ruleset gives each POI its list of elements, each with a size and attributes, rather than a single AI count;
+- coverage is decided by home POI, not by distance to existing managers, since a POI legitimately has several managers and roaming ones are rarely near it.
+
+**Reinforcement is a manager's own purpose.** That resolves where faction-wide decisions live, since factions have no component:
+1. The village's squad makes a contact report over the radio: an `Action.Communicate` occurrence with a long reach.
+2. Managers in reach score something like `Intent.Act.Reinforce`. Its conditions weigh distance, the manager's strength and engagement, Attachment, and whether anyone has already answered.
+3. The winner sets its objective and gives the order, and members score the order with Discipline against Fear.
+4. Responders radio back, so a novelty condition stops every nearby manager from emptying out for the same village.
+5. Returning home is another purpose, scored by Attachment and distance from home once the threat fades.
+
+A QRF is a manager whose home is the faction base, with low Attachment and reinforcement purposes. The mechanic is open to players: attacking village A draws garrison B's roaming element away and thins B's POI, and killing the radio operator first means nobody comes.
+
+**Faction lists (revised 2026-11-19).** The subsystem holds one list per faction: a struct with its `EFactionID` and a `TMap<FPurposeEntity, TObjectPtr<UPurposeAbilityComponent>>` (a `UPROPERTY`, so GC knows about it). Managers and their members share it, keyed by entity id, so the faction in an id says which list to search (see "Reference identity"). It's read only on the game thread. Purpose providers take faction 0 ids but stay out of the lists, since they're never candidates.
 
 **Top-down routing:**
-1. Every occurrence goes to the root. An AI raising one talks to the director subsystem and needs no reference to its own group.
+1. Every occurrence goes to the root. An AI raising one talks to the subsystem and needs no reference to its own group.
 2. Each level culls its children against the occurrence's reach, the maximum radius in its signature:
-   - the director checks platoon bounds,
-   - each platoon checks squad bounds,
-   - each squad checks its members.
+   - the subsystem checks each faction's bounds,
+   - then each of that faction's managers' bounds,
+   - and each manager checks its members.
 3. Each level appends itself as a subject for the candidates beneath it.
-4. The root holds every faction, so the descent crosses hierarchies. An enemy's platoon is checked the same way as an ally's.
+4. The root holds both factions, so the descent crosses hierarchies. An enemy's squad is checked the same way as an ally's.
 
-Bottom-up looks self-isolating, but anything crossing factions has to climb to the top anyway. It would also switch to top-down as soon as it reached a level with several platoons, because their squads need bounds checks.
+Bottom-up looks self-isolating, but anything crossing factions has to climb to the top anyway.
 
-**No back-references.** AI never store "my squad". A member list in the group and a group pointer in every AI would be two records of the same fact to keep in sync through reassignment, promotion and death. Instead:
+**One record of membership.** A member's entity id is both its key in the faction list and the encoding of its manager, so membership is written once, when the manager issues the id. A transfer replaces the id instead of updating a second record. Conditions still never use it. Instead:
 - The occurrence brings the chain as subjects.
 - Selection-time validation uses the group subject already in the selected context.
-- Groups subscribe to a member's death or end-play when they register it.
 
 **Other details:**
 - **Bounds:** recomputed from members at a low rate, not every frame. The cull runs on the game thread when the occurrence is raised, and snapshots are built only for the candidates that survive it.
-- **Players** belong to groups too, so their occurrences route the same way and they can be subjects. They're never candidates.
-- **If squads scatter enough to cull poorly,** add the area of operation as a level between the director and the platoons.
+- **Players** belong to groups too, so their occurrences route the same way and they can be subjects. They're never candidates, and no manager acquires them.
 
 This replaces Performance #3's spatial-filtering fix.
 
-### Reference identity
+### Session startup and the actor pool (planned 2026-11-18)
 
-**References need an id that outlives a pointer.** Novelty ("has my squad heard about enemy A"), communicated content and history keys all name who they're about.
-- `TObjectKey` is stable only within one process. It means nothing to a delegated brain on a client or after host migration.
-- **Recommendation:** each character gets a `uint32` id from the director when it registers. It's stored in the component's data and serialized in host-migration snapshots.
-- Non-character references (a POI, a heard sound's location) use their provider's id, or the tactical grid cell they fall in.
+How a session's AI come to exist on a generated map (see Roadmap.md → "World generation"):
+1. **The bunker.** The player loads into a basement with the level empty. The actor pool starts filling straight away, so spawn cost is spent while nobody is playing.
+2. **Biome selection** picks the skybox and the two factions.
+3. **Generation.** Mesh terrain and PCG run behind walls high enough that the player can't see the map. PCG places the POIs with what the ruleset decided for each.
+4. **World ready.** Terrain, navmesh and the tactical grid all exist. Runtime-generated terrain needs its navmesh built before any AI moves, so managers wait for this signal rather than reacting to each POI as PCG spawns it. `UPCGComponent::OnPCGGraphGeneratedDelegate` (`PCGComponent.h`) reports when a graph finishes.
+5. **Managers.** The subsystem sets up the two factions at the player bases and creates a manager for each squad the POIs call for. Each manager acquires its members from the pool.
+6. **Deploy:** on foot, by plane, car or helicopter.
+
+**The pool is its own system**, a world subsystem that knows nothing about purposes. It owns every body's actor lifetime. Managers acquire and release bodies; they never create or destroy them.
+- **Parked bodies** are hidden, with collision, tick, movement and animation off. They aren't registered, so they're never candidates.
+- **Size** comes from the biome and the PCG ruleset: squads × squad size, plus a margin for reinforcements.
+- **Dressing on acquire.** Kit is attached static meshes and colors are Custom Primitive Data (see Rendering.md), so one pooled body can become any faction's character.
+- **Reset on release:** remove active GEs, cancel abilities, clear owned and loose tags, and clear history, relevance records and current behaviors. Attributes come from the new profile on the next acquire.
+
+### Reference identity (revised 2026-11-19)
+
+Two kinds of identity, for two jobs:
+
+| | Management | Perception and selection |
+|---|---|---|
+| What | `FPurposeEntity`: faction, manager and member packed into a `uint32` | The `UPurposeAbilityComponent`, plus its life count |
+| Used by | The subsystem and managers: routing, ownership, lookups in the faction lists | Conditions, history, relevance, novelty, references, occurrence records |
+| Changes when | The member moves to another manager | Never while the character lives |
+
+**`FPurposeEntity` is strictly for management.** Conditions never read it. AI reference each other only through the purpose component, so changing an entity id can't affect anything an AI knows. Members can move between managers, such as when depleted squads merge: the new manager issues a new entity id, and everything others perceived about that character still matches.
+
+**Entity id layout:** 8 bits faction, 12 bits manager, 12 bits member.
+
+```
+ 31      24 23          12 11           0
+[ faction  |   manager    |    member    ]
+  EFactionID   1 … 4095      1 … 4095
+```
+
+- **Zero means "this level itself".** Member 0 is the manager, manager 0 is the faction, and 0 overall is invalid. A member decodes to its manager by clearing the member bits.
+- **Each field owns its bits,** so decoding always returns what was encoded, as long as each value fits its width. `Make` checks the manager and member against their masks. The faction can't overflow because `EFactionID` is a `uint8`, and a `static_assert` guards that.
+- **Indices are never reused.**
+  - **Managers** are never removed from a faction list, so a new manager's index is the list's `Num() + 1` (0 is the faction itself). A `check` that the key isn't already present guards that assumption if removal is ever added.
+  - **Members** leave (death, release to the pool, transfer), so a member count shrinks. Each manager keeps a member counter that only increases, and an acquire or a transfer takes the next index. 4,095 of each covers a session; `uint64` with 8/24/32 bits is the fallback, with the same code.
+- **The enum value, not the faction's slot on the map,** so an id decodes to SAS or Spetsnaz on its own, in logs and in host-migration snapshots. With 8/12/12 the fields line up with hex digits: `0x02'005'011` is faction 2, manager 5, member 17.
+- **Faction 0 ("None")** is for entities outside both factions: POIs, providers and world objects, and possibly players.
+
+```cpp
+USTRUCT()
+struct AO_API FPurposeEntity
+{
+	GENERATED_BODY()
+
+	static constexpr uint32 MemberBits   = 12;
+	static constexpr uint32 ManagerBits  = 12;
+	static constexpr uint32 FactionBits  = 8;
+
+	static constexpr uint32 ManagerShift = MemberBits;
+	static constexpr uint32 FactionShift = MemberBits + ManagerBits;
+
+	static constexpr uint32 MemberMask   = (1u << MemberBits) - 1;	/// 0xFFF
+	static constexpr uint32 ManagerMask  = (1u << ManagerBits) - 1;	/// 0xFFF
+	static constexpr uint32 FactionMask  = (1u << FactionBits) - 1;	/// 0xFF
+
+	static_assert(sizeof(EFactionID) * 8 <= FactionBits, "EFactionID no longer fits FPurposeEntity's faction bits");
+
+	UPROPERTY()
+	uint32 id = 0;
+
+	static FPurposeEntity Make(EFactionID faction, uint32 manager, uint32 member)
+	{
+		check(manager <= ManagerMask && member <= MemberMask);
+		FPurposeEntity entity;
+		entity.id = (uint32(faction) << FactionShift) | (manager << ManagerShift) | member;
+		return entity;
+	}
+
+	EFactionID GetFaction() const	{ return EFactionID((id >> FactionShift) & FactionMask); }
+	uint32 GetManager() const		{ return (id >> ManagerShift) & ManagerMask; }
+	uint32 GetMember() const		{ return id & MemberMask; }
+
+	bool IsValid() const			{ return id != 0; }
+	bool IsManager() const			{ return GetManager() != 0 && GetMember() == 0; }
+	FPurposeEntity GetManagerEntity() const { FPurposeEntity entity; entity.id = id & ~MemberMask; return entity; }
+
+	bool operator==(const FPurposeEntity& other) const { return id == other.id; }
+	friend uint32 GetTypeHash(const FPurposeEntity& entity) { return entity.id; }
+};
+```
+
+**The component is the perceived identity, so pooling needs a life count (recommended).** A pooled body keeps the same component when it's reused. Without a guard, a history entry, relevance window or novelty check about enemy A would match whoever occupies A's body next, and a weak pointer from A's last life stays valid.
+- The component holds a `life` counter that the pool increments on every acquire.
+- A perceived reference is the component plus the life it had when captured. Records, history entries and references store both.
+- On the worker, compare the `TObjectKey` and life for equality, without dereferencing. On the game thread, a reference resolves only if the weak pointer is valid and its life still matches. A mismatch means the character is gone, the same as a destroyed actor.
+
+**Across processes:** `TObjectKey` is stable only within one process, so a delegated brain on a client and host-migration snapshots need a portable form of the perceived identity. That's still open (see "Open questions (this flow)").
+
+Non-character references (a POI, a heard sound's location) use their provider's id, or the tactical grid cell they fall in.
+
+**Terminology:** elsewhere in this doc, "character id" means the perceived reference (component plus life), never the entity id.
 
 ### Occurrence identity and repeats
 
@@ -462,7 +585,7 @@ Revision 2 coalesced repeats inside a time window per tag. Revision 3 has no win
 
 **The custom effect context.**
 - `UGameplayAbility::MakeEffectContext()` records the ability in the hit's effect context, readable through `GetAbility()` / `GetAbilityInstance_NotReplicated()`. That instance pointer exists only on the host and depends on the instancing policy, so it isn't enough.
-- **Add a context subclass** that carries the ids: the instigator's character id, its activation id, and the action tag that caused the hit. Allocate it by overriding `UAbilitySystemGlobals::AllocGameplayEffectContext` in a project subclass, and serialize the fields in its `NetSerialize`.
+- **Add a context subclass** that carries the ids: the instigator's life count (the instigator itself is already in the context, and replicates as an object reference), its activation id, and the action tag that caused the hit. Allocate it by overriding `UAbilitySystemGlobals::AllocGameplayEffectContext` in a project subclass, and serialize the fields in its `NetSerialize`.
 - The ids survive projectile travel time and reach a delegated brain on a client.
 - **The fire ability must build the context**, or a projectile must carry the one the ability built. A projectile calling the component's own `MakeEffectContext` loses the ability fields.
 - **Only ids go in it, not our context data.** Effect contexts are copied into every spec and replicated with effects and cues, so they should stay small. A DataMap holds UObject chunks, which don't serialize cheaply. The shooter's current behavior is private, which is the leak "Self-reaction" removes. The receiving side builds its occurrence from these ids and its own snapshots.
@@ -489,7 +612,7 @@ Revision 2 coalesced repeats inside a time window per tag. Revision 3 has no win
 - **World providers:** a `UPurposeProviderComponent` on placed actors, for example a radio with purposes describing how to use it.
   - It holds `FPurpose` entries (instanced conditions per placed actor) or asset references plus overrides.
   - It implements `IDataMapInterface`, so the radio is the subject those purposes read.
-  - It registers with the director when it streams in and unregisters when it streams out.
+  - It registers with the purpose subsystem when it streams in and unregisters when it streams out.
   - Providers in an occurrence's reach append their purposes for that occurrence's candidates, culled by the same routing. A "seek activity" occurrence is then just an occurrence.
 - **Lifetime:** purposes passed with an occurrence must stay alive until in-flight evaluations finish, so unregistering waits for them. Evaluation threads currently cache purposes; dynamic ones travel with the occurrence instead.
 - **Smart Objects** (`Engine/Plugins/Runtime/SmartObjects`, not enabled in AO) already provide placed definitions, per-slot claims and spatial queries with tag filters. A custom behavior definition could carry an `FPurpose`. Start with the provider component, which is small and in-house, and revisit Smart Objects if activities multiply. Its slot claims answer "how many can use the radio".
@@ -509,6 +632,7 @@ Attributes give AI their own character without hardcoded archetype paths.
   - **Coordination.** Leading, awaiting orders and relaying information are purposes gated by Intelligence.
 - **Discipline** weighs a heard order against Fear. A disciplined AI follows the order even under fire; an undisciplined one keeps reacting on its own. It's part of what sets a squad's grade (see "Squad coordination").
 - **Focus, boredom and distraction (revision 4)** are attributes too, changed by GEs, never by a decaying score. A guard who bores easily gains boredom faster on patrol. When the next occurrence re-scores the patrol (see "Evaluation"), its conditions read Boredom and score lower, and distraction purposes read it too. So a smaller occurrence pulls that guard away than a disciplined one. The change still waits for an occurrence (see "Principles").
+- **Loyalty (added 2026-11-19)** is how strongly a character stays with its group (see "Managers and the command hierarchy"). Like Multitask, it's derived from other attributes through a modifier calculation: Fear lowers it, Discipline and Intelligence raise it. So a frightened recruit breaks away from the squad while a disciplined one holds. Its formula is open.
 - **Multitask (added 2026-11-17)** is how many behaviors the AI can run at once, across layers (see "Behavior layers").
   - **One calculation in one place.** An innate infinite GE sets it through a `UGameplayModMagnitudeCalculation` that captures Intelligence and Fear. With the captures not snapshotted, GAS re-evaluates the active GE whenever either attribute changes (`FGameplayEffectAttributeCaptureSpec::RegisterLinkedAggregatorCallback`, `GameplayEffect.cpp`), so Multitask follows Fear as it rises and falls, and nothing ticks.
   - **Current state through tags and other GEs.** Modifiers in the GE can require State tags (`State.Suppressed` lowers it), and other GEs can modify it too: exhaustion, a stun, a drug.
@@ -526,16 +650,16 @@ Attributes give AI their own character without hardcoded archetype paths.
   - **Capturing it:** when an occurrence is raised, `RaiseOccurrence` reads the attribute with the action's tag through `UAbilitySystemComponent::GetFilteredAttributeValue`. That aggregates only the modifiers whose requirements the tag meets, and the result is copied into the record. It uses static tag containers internally, so it's game-thread only; that's where occurrences are raised anyway.
 - **Archetypes are attribute profiles.** The character defaults DataAsset (TODO in `PurposeAbilityComponent.h`) carries attribute baselines, and optionally the set of purposes granted. An archetype is never a code path.
 
-### The manager (revision 4)
+### The purpose subsystem (revision 4, revised 2026-11-18)
 
-Today nothing creates the evaluation threads, fills their caches or raises occurrences. The Lyra `ADirector_Level` that did wasn't ported, and both `PurposeSystem::Occurrence` calls in `PurposeAbilityComponent.cpp` are commented out. The manager replaces the director.
+Today nothing creates the evaluation threads, fills their caches or raises occurrences. The Lyra `ADirector_Level` that did wasn't ported, and both `PurposeSystem::Occurrence` calls in `PurposeAbilityComponent.cpp` are commented out. `UPurposeSubsystem` replaces the director for everything except in-world logic, which belongs to the managers (see "Managers and the command hierarchy").
 
-- **A world subsystem**, with a director actor it spawns to host the groups' `UGameplayTasksComponent`s, since those are actor components (see "Command hierarchy and occurrence routing").
+- **A world subsystem**, and the root of the hierarchy. There's no director actor: each manager is its own actor.
 - **Thread pool:** N identical evaluation threads, created on world begin play and stopped and joined on deinitialize. The empty `FEventThread` / `FActorThread` / `FCompanionThread` subclasses go. It includes Performance #1 (the load-balancer fix) and #2 (an `FEvent` wake that drains the whole queue).
-- **Purpose library:** loads the `UEventAsset`s and publishes them as an immutable shared version. Workers hold the version they started with, so nothing they read changes under them. Threads no longer hold references to manager-owned arrays.
-- **Registration:** `UPurposeAbilityComponent`s register on `InitAbilityActorInfo` and unregister on `EndPlay`, instead of being found by a scan. Registering assigns the character id (see "Reference identity"). Purpose providers register the same way.
-- **One entry point, `RaiseOccurrence`.** It's the only place an occurrence is built (see "Occurrences: one record, shared"). It routes the occurrence through the hierarchy and queues it. AI never hold a reference to the manager's internals or to their own group.
-- **State tag bindings:** when the library loads, the manager binds tag events for every `State.*` tag that has a definition (see "Thresholds as State tags").
+- **Purpose library:** loads the `UEventAsset`s and publishes them as an immutable shared version. Workers hold the version they started with, so nothing they read changes under them. Threads no longer hold references to subsystem-owned arrays.
+- **Registration and the faction lists:** a manager registers each character when it acquires it from the pool and unregisters it on release, and managers register themselves when they're created. Nothing is found by a scan. Registering assigns the id (see "Reference identity"). Purpose providers register the same way, in their own registry.
+- **One entry point, `RaiseOccurrence`.** It's the only place an occurrence is built (see "Occurrences: one record, shared"). It routes the occurrence through the hierarchy and queues it. AI never hold a reference to the subsystem's internals or to their own group.
+- **State tag bindings:** when the library loads, the subsystem binds tag events for every `State.*` tag that has a definition (see "Thresholds as State tags").
 
 ### Occurrences: one record, shared (revision 4)
 
@@ -548,7 +672,7 @@ Today `FContextData` is the queued occurrence, the worker's result and the runni
 
 **What the record holds:**
 - The event tag, context key, time raised, and activation id.
-- Subjects, as character ids plus weak object pointers.
+- Subjects, as perceived references: the component plus its life count when raised. A pooled body's weak pointer survives reuse, so the life count is what tells its lives apart (see "Reference identity").
 - Values captured when raised: location and direction, the performing equipment's signature attributes (see "Equipment and latent actions"), and the effect magnitude.
 - `Cause`: a weak pointer to the occurrence that started the behavior which raised this one.
 
@@ -562,10 +686,10 @@ Today `FContextData` is the queued occurrence, the worker's result and the runni
 - **`Cause` is weak**, so a chain doesn't keep its past alive. A link lives while someone's history or running behavior still refers to it and disappears when everyone has forgotten it.
 
 **When a subject is garbage collected.** The record never depends on a live object:
-- It holds the character ids and the values captured when it was raised, so a destroyed actor doesn't change who it was about or what happened. Only the weak pointer goes null.
+- It holds the perceived references and the values captured when it was raised, so a destroyed or pooled actor doesn't change who it was about or what happened. Only resolving the reference fails: the weak pointer is null, or the life count no longer matches.
 - Who a behavior belongs to isn't stored in the occurrence: the component that holds the behavior is its owner.
-- Copying wouldn't protect against this. A copy holds the same weak pointers, and strong ones would keep dead actors alive.
-- **Rule:** anything a later reader needs is captured by value when the occurrence is raised. Object pointers are only for reaching live state on the game thread, and must be null-checked.
+- Copying wouldn't protect against this. A copy holds the same references, and strong pointers would keep dead actors alive.
+- **Rule:** anything a later reader needs is captured by value when the occurrence is raised. Live objects are reached only on the game thread, and a reference that fails to resolve means the subject is gone.
 - A subject dying mid-behavior is itself an occurrence (death, or `State.Downed`), so a behavior aimed at it is replaced through the normal path.
 
 **Every happening builds a record; only some are queued.** A hit from the same activation as the last one in its context builds a record and adds a history entry pointing to it, but isn't queued for evaluation (see "Occurrence identity and repeats").
@@ -612,7 +736,7 @@ An intent definition holds its conditions, behavior ability, scoring and self we
 
 #### 1. Something happens: an occurrence
 
-Every source calls the manager's `RaiseOccurrence`, which builds the immutable record (see "Occurrences: one record, shared"). It carries the identity tag of what happened, its context key, the time it was raised, the subjects' character ids, the values captured from the performing equipment and, for actions and hits, the cause's activation id. For an action performed by a behavior, `Cause` is the occurrence that started that behavior. Sources:
+Every source calls the purpose subsystem's `RaiseOccurrence`, which builds the immutable record (see "Occurrences: one record, shared"). It carries the identity tag of what happened, its context key, the time it was raised, the subjects' character ids, the values captured from the performing equipment and, for actions and hits, the cause's activation id. For an action performed by a behavior, `Cause` is the occurrence that started that behavior. Sources:
 - **Tasks.** Each action a behavior starts already raises an occurrence (`ActionPerformed`, end of `AI_SequentialActions.cpp`'s action setup). The tag is the task's own `Action.*` tag. Communication is a task like any other. The occurrence no longer copies the behavior's subject map or context data.
 - **Equipment acting later.** A thrown grenade raises its detonation itself, carrying the thrower's id, with `Cause` pointing to the throw (see "Equipment and latent actions").
 - **Gameplay effects.** Damage arrives as a GE. Its `FGameplayEffectContext` already holds:
@@ -630,7 +754,7 @@ There is no occurrence for selecting a behavior. The behavior's first action is 
 
 #### 2. Candidates
 
-- **Top-down routing.** The occurrence descends the command hierarchy, culled by bounds against its reach. Each level appends itself as a subject (see "Command hierarchy and occurrence routing"). Purpose providers within reach add their purposes. Nobody is excluded for not perceiving it.
+- **Top-down routing.** The occurrence descends the command hierarchy, culled by bounds against its reach. Each level appends itself as a subject (see "Managers and the command hierarchy"). Purpose providers within reach add their purposes. Nobody is excluded for not perceiving it.
 - **The instigator is a candidate,** scored with the self weight (see "Self-reaction").
 - **Groups are candidates** for squad purposes, if one of their members perceived the occurrence (see "Squad tasks vs. self-reactions").
 - **Perception is data.** Per candidate, the snapshot records how it perceived the occurrence: seen, heard, felt or not at all, with a quality. Conditions decide what that means.
@@ -827,7 +951,7 @@ A player (character id 37) fires a full-auto burst at AI A. A and its ally B, 20
 ### Worked example (revision 4, 2026-11-14)
 
 What changed since revision 3:
-- The manager builds every occurrence through `RaiseOccurrence`. Records are immutable and shared, and each points to its cause.
+- The purpose subsystem builds every occurrence through `RaiseOccurrence`. Records are immutable and shared, and each points to its cause.
 - Loudness and visibility come from the equipment's attributes, captured when the occurrence is raised. There's no settings table.
 - Relevance comes from the occurrence definition's weighted list of intent tags, not a matrix.
 - Action tags name the verb (`Action.Fire`, `Action.Throw`), and the equipment is its own subject.
@@ -877,7 +1001,7 @@ A player (character id 37) carries a suppressed rifle. AI A and B are in squad S
 - Should layer and resource sets be fixed by design, or derived freely from tasks?
 - **Superseded in revision 3:** group tasks are owned by the group's tasks component, so routing them through a member's ability isn't needed.
 - Resource ID budget: body resources share 16 class IDs game-wide (12 used). Group slots use raw bits and don't count against it.
-- Character id: assigned by the director, but how is it kept stable through host migration and delegated brains?
+- Character id: assigned by the purpose subsystem, but how is it kept stable through host migration and delegated brains?
 
 ### Open questions (revision 3)
 
@@ -910,7 +1034,7 @@ Places where I'm unsure what you intended, or where a choice is still open.
 - **Who performs a squad task.** A member who perceived the occurrence and has the needed layer free. How is that member chosen among several: Intelligence, the leader, distance?
 - **What a group's snapshot holds.** Which member perceived what, the members' positions and free layers, and recent communications? Members' current intents are private, so a group can't read them either. Is that right, or does a squad know its members' intents?
 - **The leader.** No standing roles, but a squad still has a leader for "await orders". Is the leader fixed per squad, or chosen dynamically (the highest Intelligence still standing)?
-- **Generalizing candidates.** Candidates are `UPurposeAbilityComponent` today. Should groups get a small shared interface, or a component of their own?
+- **Resolved (2026-11-18): generalizing candidates.** Managers own a `UPurposeAbilityComponent`, so groups are candidates with no new type.
 
 **Ability duplication**
 - **Instancing doesn't remove `GiveAbilityDuplicate`.** GAS instantiates from the class (`CreateNewInstanceOfAbility` → `NewObject(Owner, Ability->GetClass())`, `AbilitySystemComponent_Abilities.cpp`). So per-purpose values on the inline template would be lost whatever the policy. The route in the `Design: GAS AbilitySpec SourceObject` note in `PurposeAbilityComponent.h` still applies: grant one spec per purpose per actor with the purpose asset as `SourceObject`, `InstancedPerActor`, and reuse it (Performance #4). Confirm before the refactor.
@@ -939,7 +1063,7 @@ Places where I'm unsure what you intended, or where a choice is still open.
 - **Snapshot contents.** All attributes, or only those some condition reads about other characters? Monitoring can decide, as with history.
 
 **Occurrence records**
-- **Finding a hit's cause record.** The effect context carries ids, not the record. The manager could keep live action records indexed by (character id, activation id), so a hit's record can point to its fire record. That map has to stay consistent with records being freed.
+- **Finding a hit's cause record.** The effect context carries ids, not the record. The purpose subsystem could keep live action records indexed by (character id, activation id), so a hit's record can point to its fire record. That map has to stay consistent with records being freed.
 - **Resolved (2026-11-16): chain depth.** Links are readable for a set time and pruned a margin later.
 - **Where the chain time lives:** on each occurrence definition, like retention, or one value for every link?
 - **How communicated content links in.** When a report tells F's group about R2, is the communication's record what makes R2's link visible, or does F's group get its own history entry pointing to R2?
@@ -954,7 +1078,15 @@ Places where I'm unsure what you intended, or where a choice is still open.
 - **Layers exempt from Multitask.** Does gaze (the Attention layer) count, or can every AI always look at what it's reacting to?
 
 **Manager**
-- **Subsystem plus director actor** (as written), or a single director actor.
+- **Resolved (2026-11-18): where management lives.**
+  - `UPurposeSubsystem` handles threads, library, faction lists, entity ids and routing, and holds the two factions as data. There's no world manager.
+  - One generic `AManager` class, with no subclasses, owns a `UPurposeAbilityComponent`. It assigns AI from the pool and owns their lifetime within the purpose system; the pool owns the actors (see "Managers and the command hierarchy").
+- **Players and factions.** Each faction has a player base. Are players members of the faction whose base they start from, or a side of their own that both AI factions oppose?
+- **Which faction a POI belongs to.** Does the PCG ruleset tag each POI with its faction, or is it decided by territory, such as the nearer base?
+- **Resolved (2026-11-19): reinforcements.** A manager's own purpose, answering a radio contact report (see "Managers and the command hierarchy").
+- **An abandoned home.** When every manager of a POI has left, does the faction backfill it from the pool, does its own manager return, or does it stay empty for players to take?
+- **Explicit candidate lists.** Which occurrences may name their candidates instead of being routed: self occurrences, and perhaps a manager's orders to its own members. Anything others could perceive stays routed, or occurrences start gating themselves.
+- **Pool sizing:** a fixed size per biome, or computed from what the PCG ruleset placed.
 - **Thread count**, and whether it scales with the host's core count.
 
 ## Purpose refactor: implementation order (revision 4, planned 2026-11-17)
@@ -965,22 +1097,24 @@ The order in which to build revision 4 until the Purpose system's foundation is 
 
 The worked example (revision 4) is the acceptance test for the finished foundation.
 
-### Phase 1: The manager
+### Phase 1: The purpose subsystem
 
-- [ ] `UPurposeManager` world subsystem, spawning the director actor that will host the groups' tasks components. It replaces the unported Lyra `ADirector_Level`.
+- [ ] `UPurposeSubsystem` world subsystem. It replaces the unported Lyra `ADirector_Level` for everything except in-world logic.
 - [ ] Thread pool: N identical `FPurposeEvaluationThread`s, created on world begin play and stopped and joined on deinitialize. Delete `FEventThread`, `FActorThread` and `FCompanionThread`.
 - [ ] Performance #1: the load balancer stops dropping occurrences.
 - [ ] Performance #2: an `FEvent` wake replaces the fixed `tickTimer` sleep, and each wake drains the whole queue.
-- [ ] Purpose library: load the `UEventAsset`s through the asset manager and publish them as an immutable shared version. Workers hold the version they started with; threads stop referencing manager-owned arrays.
-- [ ] Registration: `UPurposeAbilityComponent` registers on `InitAbilityActorInfo` and unregisters on `EndPlay`. The manager assigns the `uint32` character id.
+- [ ] Purpose library: load the `UEventAsset`s through the asset manager and publish them as an immutable shared version. Workers hold the version they started with; threads stop referencing subsystem-owned arrays.
+- [ ] `FPurposeEntity` and the two faction lists (`TMap<FPurposeEntity, TObjectPtr<UPurposeAbilityComponent>>`), with register and unregister calls, manager indices from `Num() + 1`, and member counters that only increase.
+- [ ] The component's life counter, and perceived references as component plus life.
+- [ ] Minimal `AManager`: a manager placed in the test map assigns AI that were placed with it and registers them with the subsystem. The pool comes in phase 10, and then the manager acquires them instead.
 - [ ] `RaiseOccurrence` as the single entry point. Routing is flat for now: every registered candidate. Re-enable the two commented-out `PurposeSystem::Occurrence` calls in `PurposeAbilityComponent.cpp` through it.
 
-**Decide first:** subsystem plus director actor, or a single director actor. Thread count, and whether it scales with cores.
-**Done when:** AI in a test map select and perform behaviors again. Threads sleep on the event when idle, and nothing is dropped under a burst of occurrences.
+**Decide first:** thread count, and whether it scales with cores.
+**Done when:** AI assigned to a manager in a test map select and perform behaviors again. Threads sleep on the event when idle, and nothing is dropped under a burst of occurrences.
 
 ### Phase 2: The occurrence record
 
-- [ ] `FOccurrenceEvent`: tag, context key, raise time, activation id, subjects as character ids plus weak pointers, values captured by value, and a weak `Cause`. Built only in `RaiseOccurrence`, held as `TSharedRef<const FOccurrenceEvent>`.
+- [ ] `FOccurrenceEvent`: tag, context key, raise time, activation id, subjects as perceived references (component plus life), values captured by value, and a weak `Cause`. Built only in `RaiseOccurrence`, held as `TSharedRef<const FOccurrenceEvent>`.
 - [ ] The queued job becomes the record plus the candidate and subject snapshots. `FContextData` stops being occurrence, result and behavior at once.
 - [ ] The running behavior is {record, purpose pointer, score}. There's no selection struct.
 - [ ] Remove the intent leaks: `SnapshotSubject` appending the current behavior to the Instigator and EventTarget snapshots, and `ActionPerformed` copying the behavior's subject map and context data.
@@ -1011,7 +1145,7 @@ The worked example (revision 4) is the acceptance test for the finished foundati
 - [ ] Equipment GEs: in hand only. The fire GE uses source-aggregated stacking, `StackLimitCount` 1 and refresh on application. The suppressor is a multiply modifier requiring `Action.Fire`.
 - [ ] Capture in `RaiseOccurrence` through `GetFilteredAttributeValue` with the action's tag. Throwables read `GetStaticMagnitudeIfPossible` from their own GE.
 - [ ] Continuous actions: the re-raise interval on the action's definition, checked on rounds and footstep notifies, with the count carried in the record.
-- [ ] Custom effect context carrying character id, activation id and action tag. It needs a project `UAbilitySystemGlobals` subclass overriding `AllocGameplayEffectContext`, set in config.
+- [ ] Custom effect context carrying the instigator's life count, activation id and action tag. It needs a project `UAbilitySystemGlobals` subclass overriding `AllocGameplayEffectContext`, set in config.
 - [ ] Hits as a source, through `OnGameplayEffectAppliedDelegateToSelf`.
 - [ ] Thresholds: a GE grants `State.Suppressed` and `State.Downed`, which raise self occurrences.
 
@@ -1071,16 +1205,20 @@ The worked example (revision 4) is the acceptance test for the finished foundati
 
 **Done when:** "Moving!" plays on the Voice layer while the AI runs to cover, once per reference.
 
-### Phase 10: Groups and providers
+### Phase 10: Managers, groups and providers
 
-- [ ] `UPurposeGroup` (recursive, `IDataMapInterface`), with its root on the manager and a tasks component per group on the director actor.
-- [ ] Top-down routing culled by bounds against reach. This replaces phase 1's flat routing and Performance #3.
-- [ ] Groups as candidates, which needs the candidate type generalized. Slots as raw resource bits, free-slot picking, and performer choice among the members who perceived the occurrence.
+- [ ] Factions as data on the subsystem: two per session, each with its player base, managers, bounds and a DataMap as a subject.
+- [ ] The actor pool: its own world subsystem, filling from bunker load, with parking, dressing on acquire and reset on release. Managers move from assigning placed AI to acquiring from the pool, and ids are reassigned on every acquire.
+- [ ] The startup flow: biome selection picks the factions, PCG places the POIs, the world-ready signal fires (terrain, navmesh, tactical grid), and the subsystem creates a manager for each squad a POI calls for (see "Session startup and the actor pool").
+- [ ] Top-down routing culled by bounds against reach: subsystem, then factions, then managers, then members. This replaces phase 1's flat routing and Performance #3.
+- [ ] Groups as candidates through their managers' components. Slots as raw resource bits, free-slot picking, and performer choice among the members who perceived the occurrence.
+- [ ] Home and objective in the manager's data, Attachment on the manager and Loyalty on characters, and several managers per POI from the ruleset's element list.
+- [ ] Reinforcement as a manager purpose answering radio contact reports, returning home, and the QRF at each base. Squads merging is managers handing over members.
 - [ ] Orders as heard `Action.Communicate.*` occurrences, weighed by Discipline against Fear.
 - [ ] `UPurposeProviderComponent` on placed actors, registering on stream in and out.
 - [ ] Equipment subject and latent actions: the grenade's throw and detonation records, linked by `Cause`.
 
-**Decide first:** who performs a squad task, how the leader is chosen, what a group's snapshot holds, and the shared candidate interface.
+**Decide first:** who performs a squad task, how the leader is chosen, and what a group's snapshot holds. Whether players belong to a faction, how a POI's faction is chosen, who decides on reinforcements, and pool sizing.
 **Done when:** the revision 4 worked example plays out in a test map, from the bored guard and the bird through the grenade to F learning through communication.
 
 ### After the foundation
@@ -1158,7 +1296,7 @@ Revision 2 rebuilt a fine area-of-operation tier at runtime with traces. At 80 r
 
 **Runtime: the baked tile plus overlays.**
 - **Dynamic props** (barrels, vehicles, debris at rest) are stamped analytically from their bounds on a background task.
-- **The area of operation** only marks where overlays apply, so moving it rebuilds nothing. It can still be the level between the director and platoons in occurrence routing.
+- **The area of operation** only marks where overlays apply, so moving it rebuilds nothing. It can still be a level between faction and squad in occurrence routing.
 
 **Repairs after destruction.** The fracture occurrence (server-side, per [Physics.md](Physics.md)) gives the broken bounds.
 1. **Dirty set:** on a background task, check the cells within `MaxDistance` of those bounds. A direction is dirty only if its stored first blocker lies inside the bounds. That's arithmetic on our own data, and it usually leaves a small set.

@@ -26,13 +26,3 @@ void AManager::Tick(float DeltaTime)
 
 }
 
-
-#include "Misc/Crc.h"
-
-#if UE_BUILD_DEBUG
-uint32 GetTypeHash(const FHashMeIfYouCan& Thing)
-{
-	uint32 Hash = FCrc::MemCrc32(&Thing, sizeof(FHashMeIfYouCan));
-	return Hash;
-}
-#endif
