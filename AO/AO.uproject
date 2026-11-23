@@ -1,206 +1,206 @@
 {
-    "FileVersion":  3,
-    "EngineAssociation":  "{213F6A1D-4A1A-B68D-E13F-0FA4BE7D3011}",
-    "Category":  "",
-    "Description":  "",
-    "Modules":  [
-                    {
-                        "Name":  "AO",
-                        "Type":  "Runtime",
-                        "LoadingPhase":  "Default",
-                        "AdditionalDependencies":  [
-                                                       "Engine"
-                                                   ]
-                    }
-                ],
-    "Plugins":  [
-                    {
-                        "Name":  "OpenXR",
-                        "Enabled":  true
-                    },
-                    {
-                        "Name":  "OpenXREyeTracker",
-                        "Enabled":  true
-                    },
-                    {
-                        "Name":  "OpenXRHandTracking",
-                        "Enabled":  true
-                    },
-                    {
-                        "Name":  "Iris",
-                        "Enabled":  true
-                    },
-                    {
-                        "Name":  "PICOController",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "Paper2D",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "Cascade",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "AndroidMedia",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "AvfMedia",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "WmfMedia",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "MediaPlate",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "MediaCompositing",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "MediaPlayerEditor",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "AndroidMoviePlayer",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "AppleMoviePlayer",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "WebMMoviePlayer",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "WindowsMoviePlayer",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "GooglePAD",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "GoogleCloudMessaging",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "OnlineSubsystemGooglePlay",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "LocationServicesBPLibrary",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "MobilePatchingUtils",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "ChunkDownloader",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "LauncherChunkInstaller",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "AppleImageUtils",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "IOSDeviceProfileSelector",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "MacGraphicsSwitching",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "LinuxDeviceProfileSelector",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "DatasmithContent",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "GLTFExporter",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "AlembicImporter",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "SpeedTreeImporter",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "ArchVisCharacter",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "CableComponent",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "CustomMeshComponent",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "NNEDenoiser",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "NFORDenoise",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "ResonanceAudio",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "CharacterAI",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "BackChannel",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "RuntimeTelemetry",
-                        "Enabled":  false
-                    },
-                    {
-                        "Name":  "EditorTelemetry",
-                        "Enabled":  false
-                    },
-					          {
-						          "Name": "GameplayAbilities",
-						          "Enabled": true
-					          },
-					          {
-						          "Name": "ModularGameplay",
-						          "Enabled": true
-					          },
-					          {
-						          "Name": "PCG",
-						          "Enabled": true
-					          },
-					          {
-						          "Name": "EditorScriptingUtilities",
-						          "Enabled": true
-					          }
-                ],
-    "TargetPlatforms":  [
-                            "Windows",
-                            "Android"
-                        ]
+	"FileVersion": 3,
+	"EngineAssociation": "{213F6A1D-4A1A-B68D-E13F-0FA4BE7D3011}",
+	"Category": "",
+	"Description": "",
+	"Modules": [
+		{
+			"Name": "AO",
+			"Type": "Runtime",
+			"LoadingPhase": "Default",
+			"AdditionalDependencies": [
+				"Engine"
+			]
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "OpenXR",
+			"Enabled": true
+		},
+		{
+			"Name": "OpenXREyeTracker",
+			"Enabled": true
+		},
+		{
+			"Name": "OpenXRHandTracking",
+			"Enabled": true
+		},
+		{
+			"Name": "Iris",
+			"Enabled": true
+		},
+		{
+			"Name": "PICOController",
+			"Enabled": false
+		},
+		{
+			"Name": "Paper2D",
+			"Enabled": false
+		},
+		{
+			"Name": "Cascade",
+			"Enabled": false
+		},
+		{
+			"Name": "AndroidMedia",
+			"Enabled": false
+		},
+		{
+			"Name": "AvfMedia",
+			"Enabled": false
+		},
+		{
+			"Name": "WmfMedia",
+			"Enabled": false
+		},
+		{
+			"Name": "MediaPlate",
+			"Enabled": false
+		},
+		{
+			"Name": "MediaCompositing",
+			"Enabled": false
+		},
+		{
+			"Name": "MediaPlayerEditor",
+			"Enabled": false
+		},
+		{
+			"Name": "AndroidMoviePlayer",
+			"Enabled": false
+		},
+		{
+			"Name": "AppleMoviePlayer",
+			"Enabled": false
+		},
+		{
+			"Name": "WebMMoviePlayer",
+			"Enabled": false
+		},
+		{
+			"Name": "WindowsMoviePlayer",
+			"Enabled": false
+		},
+		{
+			"Name": "GooglePAD",
+			"Enabled": false
+		},
+		{
+			"Name": "GoogleCloudMessaging",
+			"Enabled": false
+		},
+		{
+			"Name": "OnlineSubsystemGooglePlay",
+			"Enabled": false
+		},
+		{
+			"Name": "LocationServicesBPLibrary",
+			"Enabled": false
+		},
+		{
+			"Name": "MobilePatchingUtils",
+			"Enabled": false
+		},
+		{
+			"Name": "ChunkDownloader",
+			"Enabled": false
+		},
+		{
+			"Name": "LauncherChunkInstaller",
+			"Enabled": false
+		},
+		{
+			"Name": "AppleImageUtils",
+			"Enabled": false
+		},
+		{
+			"Name": "IOSDeviceProfileSelector",
+			"Enabled": false
+		},
+		{
+			"Name": "MacGraphicsSwitching",
+			"Enabled": false
+		},
+		{
+			"Name": "LinuxDeviceProfileSelector",
+			"Enabled": false
+		},
+		{
+			"Name": "DatasmithContent",
+			"Enabled": false
+		},
+		{
+			"Name": "GLTFExporter",
+			"Enabled": false
+		},
+		{
+			"Name": "AlembicImporter",
+			"Enabled": false
+		},
+		{
+			"Name": "SpeedTreeImporter",
+			"Enabled": false
+		},
+		{
+			"Name": "ArchVisCharacter",
+			"Enabled": false
+		},
+		{
+			"Name": "CableComponent",
+			"Enabled": false
+		},
+		{
+			"Name": "CustomMeshComponent",
+			"Enabled": false
+		},
+		{
+			"Name": "NNEDenoiser",
+			"Enabled": false
+		},
+		{
+			"Name": "NFORDenoise",
+			"Enabled": false
+		},
+		{
+			"Name": "ResonanceAudio",
+			"Enabled": false
+		},
+		{
+			"Name": "CharacterAI",
+			"Enabled": false
+		},
+		{
+			"Name": "BackChannel",
+			"Enabled": false
+		},
+		{
+			"Name": "RuntimeTelemetry",
+			"Enabled": false
+		},
+		{
+			"Name": "EditorTelemetry",
+			"Enabled": false
+		},
+		{
+			"Name": "GameplayAbilities",
+			"Enabled": true
+		},
+		{
+			"Name": "ModularGameplay",
+			"Enabled": true
+		},
+		{
+			"Name": "PCG",
+			"Enabled": true
+		},
+		{
+			"Name": "EditorScriptingUtilities",
+			"Enabled": true
+		}
+	],
+	"TargetPlatforms": [
+		"Windows",
+		"Android"
+	]
 }

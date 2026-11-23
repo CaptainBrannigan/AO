@@ -433,6 +433,12 @@ So no AI is active in the purpose system without a manager, and membership has a
 
 A QRF is a manager whose home is the faction base, with low Attachment and reinforcement purposes. The mechanic is open to players: attacking village A draws garrison B's roaming element away and thins B's POI, and killing the radio operator first means nobody comes.
 
+**Faction strength by area (planned 2026-11-19).** Sites and regions come from the generated site tree (`FPOIId`, see WorldGeneration.md → "POIs and the site tree"). Each holds two numbers per faction:
+- **Assigned:** members of managers whose home is a POI in it. It changes on register, unregister and transfer, so it's event-driven and needs no polling.
+- **Present:** members of managers whose centroid is currently in it. It updates when a manager's low-rate bounds recompute moves its centroid into another site. The site of a position comes from the tactical grid's site layer (see "Building the grid from PCG").
+
+A region sums its sites. Sites and regions are subjects (DataMaps on the subsystem), so reinforcement and return-home conditions read them. The gap between assigned and present is what players manipulate: a site whose garrison left to reinforce still has its assigned strength, but little is present. Start with member counts; a strength value from attributes (health, equipment) can replace the count later.
+
 **Faction lists (revised 2026-11-19).** The subsystem holds one list per faction: a struct with its `EFactionID` and a `TMap<FPurposeEntity, TObjectPtr<UPurposeAbilityComponent>>` (a `UPROPERTY`, so GC knows about it). Managers and their members share it, keyed by entity id, so the faction in an id says which list to search (see "Reference identity"). It's read only on the game thread. Purpose providers take faction 0 ids but stay out of the lists, since they're never candidates.
 
 **Top-down routing:**
@@ -1319,6 +1325,35 @@ Revision 2 rebuilt a fine area-of-operation tier at runtime with traces. At 80 r
 - **Bad readings:** a soldier in frame looks like a wall, and depth can't tell whether something is penetrable.
 - **Redundancy:** the game already knows when props move or something is destroyed.
 
+### Building the grid from PCG (planned 2026-11-19)
+
+On a generated map there's nothing to bake in the editor, so the grid is built from the same data PCG places, while it places it. It uses no physics queries and no rendering, so it's plain background work. See WorldGeneration.md for the generation side.
+
+**Inputs, all data:**
+- **Ground height per cell** from the terrain generator's own height data. Sampling it with traces would race the game thread.
+- **Props and buildings** as PCG points: a mesh and a transform each.
+- **A cover stamp per mesh asset,** baked once in the editor. It's the asset's occupancy in local space at cell resolution: per height band, solid or penetrable bits. Buildings add their floors and interiors as extra slices. Foliage stamps are penetrable only, so they conceal without covering.
+
+**Layers per tile:**
+
+| Layer | Content | Published |
+|---|---|---|
+| Site layer | 2 bytes per column: the site id (`FPOIId` with POI 0). It answers "which site is this position in" for faction strength | Yes |
+| Ground and floors | Height and headroom per cell, from the terrain and the building stamps | Yes, as part of `FTacticalCell` |
+| Occupancy | Per floor and band: solid and penetrable bits per cell, rasterized from the stamps | No, intermediate only |
+| Directional cells | `FTacticalCell`: first blocker, see-through bits and first solid, per direction | Yes |
+
+**The pipeline, per tile, on `UE::Tasks`:**
+1. **Rasterize:** each placed prop's stamp, transformed, writes into the occupancy of every tile its bounds overlap.
+2. **Sweep:** for each of the 8 directions, walk the cells against that direction. A cell's first-blocker distance is one step if its neighbor in that direction is occupied, or the neighbor's distance plus one step otherwise, capped at `MaxDistance`. That's one pass over the cells per direction and band, with no rays. The see-through bits come from carrying the first blocker's band occupancy along the same sweep, and first solid from the solid bits alone.
+3. **Publish** the tile copy-on-write, as with repairs.
+
+**Tiles depend on neighbors.** A sweep needs occupancy up to `MaxDistance` (50 m) beyond its tile. So a tile sweeps only once every tile within that apron has rasterized. Aligning the tactical tile size with the PCG partition grid (for example two 64 m tiles per 128 m PCG cell) means each finished PCG cell completes a known set of tiles.
+
+**Bones for the prototype:** the site layer, ground height and one band of occupancy, swept for the chest-height first blocker only, with a debug overlay. See-through bands, first solid and floors come next.
+
+**After generation** the grid behaves like a baked one: destruction repairs (method A or B above) and prop stamps apply unchanged. It's deterministic, built from the same inputs on any machine, so a delegated brain's client can build its own later.
+
 ### Threading
 
 - **The game thread never reads the grid.** The game thread only hands each occurrence a pointer to the current published grid, and conditions read it on the evaluation threads.
@@ -1542,7 +1577,7 @@ Intelligence can set the prediction time and the precision used (see "Character 
 - How AO bounds are chosen, and how often they move. They only decide where overlays apply now.
 - Characters aren't in the grid. Is a separate check needed for bodies blocking sight?
 - Delegated brains: the client running an area's AI needs the grid. The baked tier ships with the map; overlays and repairs would have to be applied on that client too.
-- **Generated maps (idea, 2026-11-11):** if maps are generated per session by PCG on mesh terrain, the grid could be built in parallel from the PCG data as terrain and props are placed, instead of baked from captures. Each client would build it from the same seed. See [Roadmap.md](Roadmap.md) "World generation".
+- **Generated maps:** planned 2026-11-19 in "Building the grid from PCG". Open there: how fine the stamps' occupancy must be for thin cover, and whether one band is enough to test the sweep before adding the rest.
 
 ## Performance
 

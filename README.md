@@ -31,5 +31,6 @@ When a topic spans systems, keep the full write-up in the system that owns it an
 | [Rendering.md](Rendering.md) | Art direction and rendering: textureless color regions, character composition, material animation, Nanite, VR engine settings, polycount testing |
 | [Networking.md](Networking.md) | Session model, matchmaking, host migration, community moderation, inventory integrity |
 | [Physics.md](Physics.md) | Destruction and world interaction (Chaos + Box3D split) |
+| [WorldGeneration.md](WorldGeneration.md) | Per-session PCG maps: what each machine generates, seed replication, determinism, frame budgets, the POI site tree, prototype steps |
 | [MeshAuthoring.md](MeshAuthoring.md) | Checklist for authoring meshes for the color-region material |
 | `Tools/Profiling/` | Trace analysis scripts (`analyze_trace.ps1`); usage in Engine.md → "Analysis tooling" |

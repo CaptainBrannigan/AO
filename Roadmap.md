@@ -42,7 +42,7 @@ Alongside: define the "why play?" (see [Vision.md](Vision.md)).
 
 ## World generation (idea, 2026-11-11, unverified)
 
-Procedurally generated maps on mesh terrain, built per session while the player prepares in the base.
+Procedurally generated maps on mesh terrain, built per session while the player prepares in the base. Design and prototype steps: → [WorldGeneration.md](WorldGeneration.md) (planned 2026-11-19).
 
 - **Mesh terrain:** the 5.8 source has it as experimental plugins: `MeshPartition` ("large-scale mesh authoring through spatial partitioning, non-destructive modifier editing, platform-adaptive runtime representations"), `MeshTerrainMode` (editor tools) and `PCGMeshPartitionInterop`. It reads as an extension of Nanite and landscape that PCG can deform.
 - **Flow:** the map starts as a completely flat base with the player's base on it. The player spawns in the basement and can't see the map. While they move through the base preparing to infil, the map generates. When it's done, the infil helicopter becomes available and the player enters the match. The map stays for as long as that session is open, so every new session gets a different map.
